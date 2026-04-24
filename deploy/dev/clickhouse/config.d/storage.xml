@@ -1,0 +1,38 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <s3_cold>
+                <type>s3</type>
+                <endpoint>http://minio:9000/clusters-cold/</endpoint>
+                <access_key_id>devuser</access_key_id>
+                <secret_access_key>devpassword</secret_access_key>
+                <region>us-east-1</region>
+                <metadata_path>/var/lib/clickhouse/disks/s3_cold/</metadata_path>
+                <send_metadata>true</send_metadata>
+            </s3_cold>
+
+            <s3_cold_cache>
+                <type>cache</type>
+                <disk>s3_cold</disk>
+                <path>/var/lib/clickhouse/disks/s3_cold_cache/</path>
+                <!-- Dev: 10 GB cache. Prod target: 100 GB per CH node. -->
+                <max_size>10737418240</max_size>
+                <cache_on_write_operations>false</cache_on_write_operations>
+            </s3_cold_cache>
+        </disks>
+
+        <policies>
+            <hot_cold>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                    </hot>
+                    <cold>
+                        <disk>s3_cold_cache</disk>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </hot_cold>
+        </policies>
+    </storage_configuration>
+</clickhouse>
