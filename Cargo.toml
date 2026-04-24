@@ -7,6 +7,8 @@ members = [
     "crates/clickhouse-sink",
     "crates/query-api",
     "crates/ops",
+    "crates/cluster-ingest",
+    "crates/cluster-api",
 ]
 
 [workspace.package]
@@ -26,10 +28,12 @@ thiserror = "1"
 async-trait = "0.1"
 futures = "0.3"
 bytes = "1"
+dashmap = "6"
+crc32fast = "1"
 
 [workspace.lints.rust]
 unused_must_use = "deny"
-rust_2018_idioms = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

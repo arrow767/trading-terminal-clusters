@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,4 +103,60 @@ pub struct ClusterBucket {
     pub bid_qty: i64,
     pub ask_qty: i64,
     pub trades: u32,
+}
+
+/// Cheap-to-clone identity of a subscribed instrument. Used as a key in
+/// the broadcast bus and various registries; `Arc<str>` keeps clones
+/// pointer-sized.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymbolKey {
+    pub exchange: Exchange,
+    pub market_type: MarketType,
+    pub symbol: Arc<str>,
+}
+
+impl SymbolKey {
+    pub fn new(exchange: Exchange, market_type: MarketType, symbol: impl Into<Arc<str>>) -> Self {
+        Self {
+            exchange,
+            market_type,
+            symbol: symbol.into(),
+        }
+    }
+}
+
+/// Full state of the current (still-open) time window for one instrument.
+/// Wire-equivalent of fat-terminal's `AnalyticsSnapshot` (union id 104).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsSnapshot {
+    pub window_start_ns: i64,
+    pub sequence: i64,
+    pub clusters: Vec<ClusterBucket>,
+}
+
+/// Incremental update since the last snapshot/diff for the same window.
+/// Wire-equivalent of fat-terminal's `AnalyticsDiff` (union id 105).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsDiff {
+    pub window_start_ns: i64,
+    pub sequence: i64,
+    pub upserts: Vec<ClusterBucket>,
+    pub removes: Vec<i64>,
+}
+
+/// Unit of broadcast through the bus. Arc-wrapped so fan-out to N
+/// subscribers does not clone the inner Vec.
+#[derive(Debug, Clone)]
+pub enum ClusterFrame {
+    Snapshot(Arc<AnalyticsSnapshot>),
+    Diff(Arc<AnalyticsDiff>),
+}
+
+impl ClusterFrame {
+    pub fn sequence(&self) -> i64 {
+        match self {
+            ClusterFrame::Snapshot(s) => s.sequence,
+            ClusterFrame::Diff(d) => d.sequence,
+        }
+    }
 }

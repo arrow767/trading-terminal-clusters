@@ -1,17 +1,22 @@
 [package]
-name = "cluster-engine"
+name = "cluster-api"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "cluster-api"
+path = "src/main.rs"
+
 [dependencies]
 exchange-core = { path = "../exchange-core" }
+query-api = { path = "../query-api" }
+ops = { path = "../ops" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-serde = { workspace = true }
-dashmap = { workspace = true }
+anyhow = { workspace = true }
 
 [lints]
 workspace = true
