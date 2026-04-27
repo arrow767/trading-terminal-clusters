@@ -15,6 +15,11 @@ use tokio_tungstenite::tungstenite::Message;
 /// we increment a drop counter rather than stalling the WS read loop,
 /// because a stalled read would let the pong deadline expire and Binance
 /// would close the connection.
+///
+/// `Clone` is cheap (Sender is an Arc internally) so the orchestrator
+/// can hold the canonical list and pass `&[SymbolRoute]` to each
+/// reconnect attempt.
+#[derive(Clone)]
 pub struct SymbolRoute {
     pub spec: SymbolSpec,
     pub sink: mpsc::Sender<TradePrint>,
@@ -30,7 +35,7 @@ pub struct SymbolRoute {
 /// we give up rather than letting the dial hang indefinitely.
 pub async fn run_session(
     connector: &BinanceFuturesWs,
-    routes: Vec<SymbolRoute>,
+    routes: &[SymbolRoute],
     connect_timeout: Duration,
 ) -> Result<SessionStats> {
     if routes.is_empty() {
@@ -54,7 +59,7 @@ pub async fn run_session(
 
     let mut routing: HashMap<String, SymbolRoute> = HashMap::with_capacity(routes.len());
     for r in routes {
-        routing.insert(r.spec.symbol.to_ascii_uppercase(), r);
+        routing.insert(r.spec.symbol.to_ascii_uppercase(), r.clone());
     }
 
     let parser = BinanceFuturesTradeParser;
@@ -230,7 +235,7 @@ mod tests {
             },
         ];
 
-        let stats = run_session(&connector, routes, Duration::from_secs(2))
+        let stats = run_session(&connector, &routes, Duration::from_secs(2))
             .await
             .unwrap();
 
@@ -255,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_when_no_routes() {
         let connector = BinanceFuturesWs::with_url("ws://127.0.0.1:1");
-        let r = run_session(&connector, vec![], Duration::from_millis(100)).await;
+        let r = run_session(&connector, &[], Duration::from_millis(100)).await;
         assert!(r.is_err());
     }
 }
