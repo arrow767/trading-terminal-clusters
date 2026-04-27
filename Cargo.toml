@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/exchange-core",
+    "crates/exchange-binance",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",
@@ -30,6 +31,7 @@ futures = "0.3"
 bytes = "1"
 dashmap = "6"
 crc32fast = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [workspace.lints.rust]
 unused_must_use = "deny"
