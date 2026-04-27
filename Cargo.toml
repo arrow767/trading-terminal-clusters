@@ -32,6 +32,8 @@ bytes = "1"
 dashmap = "6"
 crc32fast = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+futures-util = "0.3"
 
 [workspace.lints.rust]
 unused_must_use = "deny"

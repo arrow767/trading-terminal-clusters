@@ -17,13 +17,27 @@ use crate::scale::parse_scaled;
 /// existing fat-terminal pipeline.
 pub struct BinanceFuturesTradeParser;
 
-impl TradeParser for BinanceFuturesTradeParser {
-    fn parse(&self, raw: &[u8], spec: &SymbolSpec) -> Result<Option<TradePrint>> {
-        let v: serde_json::Value =
-            serde_json::from_slice(raw).map_err(|e| ExchangeError::Parse(e.to_string()))?;
-        let data = v.get("data").unwrap_or(&v);
+impl BinanceFuturesTradeParser {
+    /// Inspect a payload and return the contained symbol (e.g. "BTCUSDT")
+    /// if it's an aggTrade event. Used by the WS runtime to route a
+    /// frame to the right per-symbol sink before doing the full parse.
+    pub fn peek_symbol<'a>(&self, v: &'a serde_json::Value) -> Option<&'a str> {
+        let data = v.get("data").unwrap_or(v);
+        if data.get("e").and_then(|e| e.as_str())? != "aggTrade" {
+            return None;
+        }
+        data.get("s").and_then(|s| s.as_str())
+    }
 
-        // Filter: only aggTrade events for the expected symbol.
+    /// Parse from an already-deserialized JSON value. Caller guarantees
+    /// `spec.symbol` matches the event's `s` field — the runtime
+    /// dispatches by symbol before calling this, so we skip re-checking.
+    pub fn parse_value(
+        &self,
+        v: &serde_json::Value,
+        spec: &SymbolSpec,
+    ) -> Result<Option<TradePrint>> {
+        let data = v.get("data").unwrap_or(v);
         if data.get("e").and_then(|e| e.as_str()) != Some("aggTrade") {
             return Ok(None);
         }
@@ -69,6 +83,14 @@ impl TradeParser for BinanceFuturesTradeParser {
             qty,
             trade_id,
         }))
+    }
+}
+
+impl TradeParser for BinanceFuturesTradeParser {
+    fn parse(&self, raw: &[u8], spec: &SymbolSpec) -> Result<Option<TradePrint>> {
+        let v: serde_json::Value =
+            serde_json::from_slice(raw).map_err(|e| ExchangeError::Parse(e.to_string()))?;
+        self.parse_value(&v, spec)
     }
 }
 
