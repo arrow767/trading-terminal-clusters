@@ -11,6 +11,13 @@ exchange-core = { path = "../exchange-core" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true
