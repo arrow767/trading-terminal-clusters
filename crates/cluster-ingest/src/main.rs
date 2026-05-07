@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,9 +44,23 @@ async fn main() -> Result<()> {
             binance_cfg.top_n = Some(n);
         }
     }
+    if let Ok(listen) = std::env::var("INGEST_GRPC_LISTEN") {
+        ingest.grpc_listen = listen;
+    }
 
     let bus = Arc::new(ClusterBus::new());
     let (ch_tx, ch_rx) = mpsc::channel(ingest.ch_channel_bound);
+
+    let grpc_addr: SocketAddr = ingest
+        .grpc_listen
+        .parse()
+        .with_context(|| format!("parse grpc_listen: {}", ingest.grpc_listen))?;
+    let grpc_bus = Arc::clone(&bus);
+    let grpc_handle = tokio::spawn(async move {
+        if let Err(e) = cluster_api::serve(grpc_bus, grpc_addr).await {
+            tracing::error!(error = %e, "gRPC server crashed");
+        }
+    });
 
     let ch_writer = ChWriter::new(ChWriterConfig {
         url: ingest.clickhouse_url.clone(),
@@ -98,6 +113,7 @@ async fn main() -> Result<()> {
     if let Some(t) = supervisor_task {
         let _ = t.await;
     }
+    grpc_handle.abort();
 
     Ok(())
 }

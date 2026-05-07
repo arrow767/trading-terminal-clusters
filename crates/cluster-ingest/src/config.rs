@@ -30,6 +30,8 @@ pub struct IngestConfig {
     pub trade_channel_bound: usize,
     #[serde(default = "default_ch_channel_bound")]
     pub ch_channel_bound: usize,
+    #[serde(default = "default_grpc_listen")]
+    pub grpc_listen: String,
     #[serde(default)]
     pub exchanges: ExchangesConfig,
 }
@@ -44,6 +46,7 @@ impl Default for IngestConfig {
             agg_tick_interval_ms: default_agg_tick_ms(),
             trade_channel_bound: default_trade_channel_bound(),
             ch_channel_bound: default_ch_channel_bound(),
+            grpc_listen: default_grpc_listen(),
             exchanges: ExchangesConfig::default(),
         }
     }
@@ -163,6 +166,9 @@ fn default_trade_channel_bound() -> usize {
 }
 fn default_ch_channel_bound() -> usize {
     16_384
+}
+fn default_grpc_listen() -> String {
+    "127.0.0.1:50051".into()
 }
 fn default_include_quotes() -> Vec<String> {
     vec!["USDT".into(), "USDC".into()]

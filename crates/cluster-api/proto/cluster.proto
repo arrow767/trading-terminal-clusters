@@ -1,0 +1,56 @@
+syntax = "proto3";
+package clusters;
+
+// Live cluster (footprint) frame stream. The server publishes one
+// initial state per subscribed symbol whenever an aggregator emits the
+// next snapshot or diff (no state is retained on the server, so the
+// first frame after Subscribe arrives at most one diff_interval_ms
+// after the subscription is accepted). On window roll the server emits
+// a new Snapshot. Diffs cover dirty buckets only.
+//
+// All quantities and prices are scaled to i64 (see exchange-core
+// SymbolSpec.price_scale / qty_scale). The client is expected to
+// know the scaling for the symbols it subscribed to.
+service ClusterStream {
+  rpc Subscribe(SubscribeRequest) returns (stream Frame);
+}
+
+message SubscribeRequest {
+  repeated SymbolKey symbols = 1;
+}
+
+// Wire ids: exchange uses Exchange::wire_id() ("BINANCEF", "BYBITF", ...);
+// market_type uses "PERP" or "SPOT".
+message SymbolKey {
+  string exchange = 1;
+  string market_type = 2;
+  string symbol = 3;
+}
+
+message Frame {
+  SymbolKey key = 1;
+  oneof body {
+    Snapshot snapshot = 2;
+    Diff diff = 3;
+  }
+}
+
+message Snapshot {
+  int64 window_start_ns = 1;
+  int64 sequence = 2;
+  repeated Bucket clusters = 3;
+}
+
+message Diff {
+  int64 window_start_ns = 1;
+  int64 sequence = 2;
+  repeated Bucket upserts = 3;
+  repeated int64 removes = 4;
+}
+
+message Bucket {
+  int64 price = 1;
+  int64 bid_qty = 2;
+  int64 ask_qty = 3;
+  uint32 trades = 4;
+}
