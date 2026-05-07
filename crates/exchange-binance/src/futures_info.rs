@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use exchange_core::{Exchange, ExchangeError, ExchangeInfo, MarketType, Quote, Result, SymbolSpec};
+use exchange_core::{
+    Exchange, ExchangeError, ExchangeInfo, MarketType, Quote, Result, SymbolSpec, VolumeRanker,
+};
 
 use crate::scale::parse_scaled;
 
@@ -64,6 +67,50 @@ impl ExchangeInfo for BinanceFuturesInfo {
         }
         parse_exchange_info(&body)
     }
+}
+
+#[async_trait]
+impl VolumeRanker for BinanceFuturesInfo {
+    async fn fetch_24h_quote_volumes(&self) -> Result<HashMap<String, f64>> {
+        let url = format!("{}/fapi/v1/ticker/24hr", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Network(e.to_string()))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ExchangeError::Network(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ExchangeError::Network(format!("HTTP {status}: {body}")));
+        }
+        parse_24h_quote_volumes(&body)
+    }
+}
+
+pub(crate) fn parse_24h_quote_volumes(json: &str) -> Result<HashMap<String, f64>> {
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| ExchangeError::Parse(e.to_string()))?;
+    let mut out = HashMap::with_capacity(arr.len());
+    for entry in arr {
+        let Some(symbol) = entry.get("symbol").and_then(|v| v.as_str()) else {
+            // Tolerate malformed individual entries (Binance has emitted
+            // partial objects in past incidents) — skip rather than fail
+            // the whole rank fetch over one bad row.
+            continue;
+        };
+        let Some(qv_str) = entry.get("quoteVolume").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(qv) = qv_str.parse::<f64>() else {
+            continue;
+        };
+        out.insert(symbol.to_string(), qv);
+    }
+    Ok(out)
 }
 
 pub(crate) fn parse_exchange_info(json: &str) -> Result<Vec<SymbolSpec>> {
@@ -232,5 +279,30 @@ mod tests {
     fn rejects_unparseable_json() {
         assert!(parse_exchange_info("not json").is_err());
         assert!(parse_exchange_info("{}").is_err());
+    }
+
+    const TICKER_FIXTURE: &str = r#"
+    [
+      {"symbol":"BTCUSDT","quoteVolume":"123456789.0","priceChange":"0"},
+      {"symbol":"ETHUSDT","quoteVolume":"45000000.5","priceChange":"0"},
+      {"symbol":"DOGEUSDT","quoteVolume":"100.0","priceChange":"0"},
+      {"symbol":"BADENTRY"},
+      {"quoteVolume":"99.0"}
+    ]
+    "#;
+
+    #[test]
+    fn parses_ticker_volumes_and_skips_malformed() {
+        let m = parse_24h_quote_volumes(TICKER_FIXTURE).unwrap();
+        assert_eq!(m.len(), 3);
+        assert!((m["BTCUSDT"] - 123_456_789.0).abs() < 1e-3);
+        assert!((m["ETHUSDT"] - 45_000_000.5).abs() < 1e-3);
+        assert!(!m.contains_key("BADENTRY"));
+    }
+
+    #[test]
+    fn ticker_rejects_non_array() {
+        assert!(parse_24h_quote_volumes("{}").is_err());
+        assert!(parse_24h_quote_volumes("not json").is_err());
     }
 }

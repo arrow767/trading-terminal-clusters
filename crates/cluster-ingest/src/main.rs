@@ -77,9 +77,16 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let supervisor_task = if binance_cfg.enabled {
-        let info = Arc::new(BinanceFuturesInfo::new());
+        // One Arc, two trait views: ExchangeInfo for symbol discovery,
+        // VolumeRanker for top-N ordering. Sharing the underlying
+        // BinanceFuturesInfo keeps the reqwest client (with its
+        // connection pool) shared between both endpoints.
+        let raw = Arc::new(BinanceFuturesInfo::new());
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
         let supervisor = BinanceSupervisor::new(
             info,
+            ranker,
             Arc::clone(&bus),
             ingest.region.clone(),
             ingest.clone(),

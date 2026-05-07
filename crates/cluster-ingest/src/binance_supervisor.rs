@@ -7,13 +7,13 @@ use clickhouse_sink::{rows_from_snapshot, ClusterRow};
 use cluster_engine::{run_aggregator, Aggregator, ClusterBus};
 use exchange_binance::BinanceFuturesWs;
 use exchange_core::{
-    ClusterFrame, Exchange, ExchangeInfo, MarketType, Quote, SymbolKey, SymbolSpec,
+    ClusterFrame, Exchange, ExchangeInfo, MarketType, Quote, SymbolKey, SymbolSpec, VolumeRanker,
 };
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::binance_session::{run_session, SymbolRoute};
-use crate::config::{BinancePerpConfig, IngestConfig};
+use crate::config::{BinancePerpConfig, IngestConfig, RankBy};
 
 /// One supervisor owns the entire pipeline for a single exchange:
 /// REST `ExchangeInfo` polling, the WS session, the per-symbol
@@ -39,6 +39,7 @@ use crate::config::{BinancePerpConfig, IngestConfig};
 /// in CLAUDE memory.
 pub struct BinanceSupervisor {
     info: Arc<dyn ExchangeInfo>,
+    ranker: Option<Arc<dyn VolumeRanker>>,
     bus: Arc<ClusterBus>,
     region: String,
     ingest: IngestConfig,
@@ -58,6 +59,7 @@ struct SymbolHandle {
 impl BinanceSupervisor {
     pub fn new(
         info: Arc<dyn ExchangeInfo>,
+        ranker: Option<Arc<dyn VolumeRanker>>,
         bus: Arc<ClusterBus>,
         region: String,
         ingest: IngestConfig,
@@ -67,6 +69,7 @@ impl BinanceSupervisor {
         let (routes_tx, _) = watch::channel(Vec::new());
         Self {
             info,
+            ranker,
             bus,
             region,
             ingest,
@@ -139,7 +142,12 @@ impl BinanceSupervisor {
             .fetch_symbols()
             .await
             .map_err(|e| anyhow::anyhow!("fetch_symbols: {e}"))?;
-        let wanted = filter_symbols(&specs, &self.cfg);
+        let filtered = filter_symbols(&specs, &self.cfg);
+        let ranked = self.rank_specs(filtered).await;
+        let wanted: Vec<SymbolSpec> = match self.cfg.top_n {
+            Some(n) => ranked.into_iter().take(n).collect(),
+            None => ranked,
+        };
         let wanted_keys: HashSet<SymbolKey> = wanted
             .iter()
             .map(|s| SymbolKey::new(s.exchange, s.market_type, s.symbol.as_str()))
@@ -191,6 +199,39 @@ impl BinanceSupervisor {
         Ok(())
     }
 
+    /// Order the filtered symbol set per `cfg.rank_by`. On any failure
+    /// of the volume fetch we log and fall through to the alphabetical
+    /// fallback rather than dropping a discovery cycle entirely.
+    async fn rank_specs(&self, mut specs: Vec<SymbolSpec>) -> Vec<SymbolSpec> {
+        match self.cfg.rank_by {
+            RankBy::Alphabetical => specs,
+            RankBy::Volume24h => {
+                let Some(ranker) = self.ranker.as_ref() else {
+                    tracing::warn!(
+                        "rank_by=volume_24h but no VolumeRanker provided; using alphabetical"
+                    );
+                    return specs;
+                };
+                let volumes = match ranker.fetch_24h_quote_volumes().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "fetch_24h_quote_volumes failed; using alphabetical fallback"
+                        );
+                        return specs;
+                    }
+                };
+                specs.sort_by(|a, b| {
+                    let va = volumes.get(&a.symbol).copied().unwrap_or(0.0);
+                    let vb = volumes.get(&b.symbol).copied().unwrap_or(0.0);
+                    vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                specs
+            }
+        }
+    }
+
     fn spawn_symbol(&self, spec: SymbolSpec) -> SymbolHandle {
         let key = SymbolKey::new(spec.exchange, spec.market_type, spec.symbol.as_str());
         let bucket_step = spec.tick_size;
@@ -222,6 +263,8 @@ impl BinanceSupervisor {
     }
 }
 
+/// Apply allow/deny/quote filters from config, but DO NOT apply
+/// `top_n` — truncation runs after ranking in `BinanceSupervisor`.
 pub fn filter_symbols(specs: &[SymbolSpec], cfg: &BinancePerpConfig) -> Vec<SymbolSpec> {
     let allow: Option<HashSet<&str>> = if cfg.allow.is_empty() {
         None
@@ -239,7 +282,7 @@ pub fn filter_symbols(specs: &[SymbolSpec], cfg: &BinancePerpConfig) -> Vec<Symb
         })
         .collect();
 
-    let mut out: Vec<SymbolSpec> = specs
+    specs
         .iter()
         .filter(|s| {
             if s.exchange != Exchange::BinanceF || s.market_type != MarketType::Perp {
@@ -259,12 +302,7 @@ pub fn filter_symbols(specs: &[SymbolSpec], cfg: &BinancePerpConfig) -> Vec<Symb
             true
         })
         .cloned()
-        .collect();
-
-    if let Some(n) = cfg.top_n {
-        out.truncate(n);
-    }
-    out
+        .collect()
 }
 
 async fn run_session_loop(
@@ -426,14 +464,16 @@ mod tests {
     }
 
     #[test]
-    fn filter_top_n_truncates() {
+    fn filter_does_not_apply_top_n() {
+        // top_n is intentionally a supervisor concern (after ranking),
+        // not a filter concern.
         let specs: Vec<_> = (0..10)
             .map(|i| spec(&format!("S{i}USDT"), Quote::Usdt))
             .collect();
         let mut c = cfg();
         c.top_n = Some(3);
         let kept = filter_symbols(&specs, &c);
-        assert_eq!(kept.len(), 3);
+        assert_eq!(kept.len(), 10);
     }
 
     /// Mock ExchangeInfo whose return value can be flipped between
@@ -445,6 +485,19 @@ mod tests {
     impl ExchangeInfo for MockInfo {
         async fn fetch_symbols(&self) -> exchange_core::Result<Vec<SymbolSpec>> {
             Ok(self.specs.lock().unwrap().clone())
+        }
+    }
+
+    /// Mock VolumeRanker with a fixed map.
+    struct MockRanker {
+        map: std::collections::HashMap<String, f64>,
+    }
+    #[async_trait]
+    impl VolumeRanker for MockRanker {
+        async fn fetch_24h_quote_volumes(
+            &self,
+        ) -> exchange_core::Result<std::collections::HashMap<String, f64>> {
+            Ok(self.map.clone())
         }
     }
 
@@ -460,6 +513,7 @@ mod tests {
         let (ch_tx, _ch_rx) = mpsc::channel(64);
         let supervisor = BinanceSupervisor::new(
             info.clone(),
+            None,
             bus.clone(),
             "test".into(),
             IngestConfig::default(),
@@ -503,5 +557,56 @@ mod tests {
         let mut sorted = final_set.clone();
         sorted.sort();
         assert_eq!(sorted, vec!["BTCUSDT".to_string(), "SOLUSDT".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn rank_by_volume_picks_top_n_by_descending_volume() {
+        let info = Arc::new(MockInfo {
+            specs: Mutex::new(vec![
+                spec("AAAUSDT", Quote::Usdt), // alphabetically first
+                spec("BTCUSDT", Quote::Usdt),
+                spec("ETHUSDT", Quote::Usdt),
+                spec("DOGEUSDT", Quote::Usdt), // tiniest volume
+            ]),
+        });
+        let ranker = Arc::new(MockRanker {
+            map: [
+                ("BTCUSDT".to_string(), 1_000_000_000.0),
+                ("ETHUSDT".to_string(), 500_000_000.0),
+                ("AAAUSDT".to_string(), 1_000.0),
+                ("DOGEUSDT".to_string(), 100.0),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let bus = Arc::new(ClusterBus::new());
+        let (ch_tx, _ch_rx) = mpsc::channel(64);
+        let mut c = cfg();
+        c.rank_by = RankBy::Volume24h;
+        c.top_n = Some(2);
+
+        let supervisor = BinanceSupervisor::new(
+            info,
+            Some(Arc::clone(&ranker) as Arc<dyn VolumeRanker>),
+            bus,
+            "test".into(),
+            IngestConfig::default(),
+            c,
+            ch_tx,
+        );
+        supervisor.reconcile_once().await.unwrap();
+
+        let kept: Vec<String> = supervisor
+            .handles
+            .read()
+            .await
+            .keys()
+            .map(|k| k.symbol.to_string())
+            .collect();
+        let mut sorted = kept.clone();
+        sorted.sort();
+        // Should keep the two highest-volume tickers, regardless of
+        // alphabetical position in the source list.
+        assert_eq!(sorted, vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
     }
 }

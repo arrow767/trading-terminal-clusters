@@ -57,6 +57,19 @@ pub struct ExchangesConfig {
     pub binance_perp: Option<BinancePerpConfig>,
 }
 
+/// Ordering applied to the filtered symbol set before `top_n` cuts it.
+/// Default `Alphabetical` matches what exchangeInfo returns and avoids
+/// extra network calls. `Volume24h` calls `/fapi/v1/ticker/24hr` once
+/// per discovery cycle and ranks descending by quote-currency notional —
+/// useful for "top 50 most-traded perps" deployments.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RankBy {
+    #[default]
+    Alphabetical,
+    Volume24h,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BinancePerpConfig {
     #[serde(default = "true_")]
@@ -77,10 +90,14 @@ pub struct BinancePerpConfig {
     #[serde(default)]
     pub deny: Vec<String>,
 
-    /// If set, truncate the filtered list to this size (used with the
-    /// API-default ordering — currently alphabetical-ish from
-    /// exchangeInfo). Useful for dev caps; leave unset in prod.
+    /// If set, keep at most this many symbols from the filtered+ranked
+    /// list. Combined with `rank_by = "volume_24h"` this gives "top N
+    /// most-traded perps". Leave unset in prod if you want everything.
     pub top_n: Option<usize>,
+
+    /// Ordering applied before `top_n` truncation. See `RankBy`.
+    #[serde(default)]
+    pub rank_by: RankBy,
 
     /// How often to re-fetch exchangeInfo and reconcile the symbol set.
     /// New listings appear at this cadence at worst; defaults to 5 min.
@@ -105,6 +122,7 @@ impl Default for BinancePerpConfig {
             allow: Vec::new(),
             deny: Vec::new(),
             top_n: None,
+            rank_by: RankBy::default(),
             discovery_poll_secs: default_discovery_poll_secs(),
             ws_connect_timeout_ms: default_ws_connect_timeout_ms(),
             reconnect_backoff_min_ms: default_backoff_min_ms(),

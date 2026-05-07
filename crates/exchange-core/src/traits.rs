@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -23,6 +25,17 @@ pub type Result<T> = std::result::Result<T, ExchangeError>;
 #[async_trait]
 pub trait ExchangeInfo: Send + Sync {
     async fn fetch_symbols(&self) -> Result<Vec<SymbolSpec>>;
+}
+
+/// Ranking of symbols by 24h quote-currency volume — used by the
+/// supervisor to pick the top-N most active symbols when `top_n` is
+/// configured. Returned values are notional in the quote currency
+/// (USDT-margined returns USDT volume, USDC-margined returns USDC).
+/// f64 is enough precision for ordering — the value is never used for
+/// settlement math.
+#[async_trait]
+pub trait VolumeRanker: Send + Sync {
+    async fn fetch_24h_quote_volumes(&self) -> Result<HashMap<String, f64>>;
 }
 
 #[derive(Debug, Clone)]
