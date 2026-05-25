@@ -10,17 +10,32 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use axum::{middleware, routing::get, Router};
+use tower_http::compression::CompressionLayer;
 
 use crate::auth::{rest_auth_middleware, AuthState};
+use crate::cluster_history::{cluster_range, ClusterHistoryState};
 use crate::sysmetrics::{system_metrics, SysMetricsState};
 
-/// Собрать REST-роутер. `auth_state` контролирует и сам middleware,
-/// и доступ /v1/system/metrics — выключенный auth превращает эндпоинт
-/// в открытый (только для dev/local!).
-pub fn router(sysmetrics_state: SysMetricsState, auth_state: AuthState) -> Router {
-    let protected = Router::new()
+/// Собрать REST-роутер.
+/// - `sysmetrics_state` + `history_state` имеют свои `with_state(...)` —
+///   axum поддерживает разные state-типы на разных под-роутерах через
+///   `Router::with_state`.
+/// - Bearer middleware — общий, прикладывается СНАРУЖИ над merge.
+/// - Gzip-compression — внутренний слой, чтобы респонзы крупных
+///   /clusters/range запросов сжимались (5–10× на columnar JSON).
+///   /health тоже сжмётся, но это копейки — не оптимизируем отдельно.
+pub fn router(
+    sysmetrics_state: SysMetricsState,
+    history_state: ClusterHistoryState,
+    auth_state: AuthState,
+) -> Router {
+    let sysmetrics = Router::new()
         .route("/v1/system/metrics", get(system_metrics))
         .with_state(sysmetrics_state);
+
+    let history = Router::new()
+        .route("/v1/clusters/range", get(cluster_range))
+        .with_state(history_state);
 
     let public = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -29,7 +44,9 @@ pub fn router(sysmetrics_state: SysMetricsState, auth_state: AuthState) -> Route
 
     Router::new()
         .merge(public)
-        .merge(protected)
+        .merge(sysmetrics)
+        .merge(history)
+        .layer(CompressionLayer::new().gzip(true))
         .layer(middleware::from_fn_with_state(
             auth_state,
             rest_auth_middleware,
@@ -40,13 +57,14 @@ pub fn router(sysmetrics_state: SysMetricsState, auth_state: AuthState) -> Route
 pub async fn serve_rest(
     addr: SocketAddr,
     sysmetrics_state: SysMetricsState,
+    history_state: ClusterHistoryState,
     auth_state: AuthState,
 ) -> Result<()> {
-    let app = router(sysmetrics_state, auth_state);
+    let app = router(sysmetrics_state, history_state, auth_state);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind REST listener on {addr}"))?;
-    tracing::info!(%addr, "cluster-api: REST server listening");
+    tracing::info!(%addr, "cluster-api: REST server listening (+gzip, +/v1/clusters/range)");
     axum::serve(listener, app).await.context("axum serve")
 }
 
@@ -66,9 +84,23 @@ mod tests {
         }
     }
 
+    fn empty_history_state() -> ClusterHistoryState {
+        ClusterHistoryState {
+            ch_client: reqwest::Client::new(),
+            ch_url: String::new(),
+            ch_database: String::new(),
+            ch_user: String::new(),
+            ch_password: String::new(),
+        }
+    }
+
+    fn app_with(auth: AuthState) -> Router {
+        router(empty_state(), empty_history_state(), auth)
+    }
+
     #[tokio::test]
     async fn health_is_public_even_when_auth_enabled() {
-        let app = router(empty_state(), AuthState::new(vec!["secret".into()], true));
+        let app = app_with(AuthState::new(vec!["secret".into()], true));
         let res = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
@@ -78,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn sysmetrics_rejects_missing_bearer() {
-        let app = router(empty_state(), AuthState::new(vec!["secret".into()], true));
+        let app = app_with(AuthState::new(vec!["secret".into()], true));
         let res = app
             .oneshot(
                 Request::builder()
@@ -93,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn sysmetrics_rejects_wrong_bearer() {
-        let app = router(empty_state(), AuthState::new(vec!["secret".into()], true));
+        let app = app_with(AuthState::new(vec!["secret".into()], true));
         let res = app
             .oneshot(
                 Request::builder()
@@ -109,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn sysmetrics_accepts_correct_bearer() {
-        let app = router(empty_state(), AuthState::new(vec!["secret".into()], true));
+        let app = app_with(AuthState::new(vec!["secret".into()], true));
         let res = app
             .oneshot(
                 Request::builder()
@@ -125,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn sysmetrics_open_when_auth_disabled() {
-        let app = router(empty_state(), AuthState::disabled());
+        let app = app_with(AuthState::disabled());
         let res = app
             .oneshot(
                 Request::builder()
@@ -136,5 +168,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn clusters_range_validates_params() {
+        // Без bearer — отказ.
+        let app = app_with(AuthState::new(vec!["secret".into()], true));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/clusters/range?exchange=BINANCEF&market_type=perp&symbol=BTCUSDT&interval_seconds=60&from_ms=0&to_ms=60000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // С bearer но без CH доступа — 502 (CH connection refused), не 5xx-крэш.
+        let app = app_with(AuthState::disabled());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/clusters/range?exchange=BINANCEF&market_type=perp&symbol=BTCUSDT&interval_seconds=60&from_ms=0&to_ms=60000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // empty ch_url → request будет невалидным URL'ом → BAD_GATEWAY
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn clusters_range_rejects_bad_interval() {
+        let app = app_with(AuthState::disabled());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/clusters/range?exchange=BINANCEF&market_type=perp&symbol=BTCUSDT&interval_seconds=45&from_ms=0&to_ms=60000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

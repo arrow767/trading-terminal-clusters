@@ -99,22 +99,37 @@ async fn main() -> Result<()> {
         }
     });
 
-    // REST: /v1/system/metrics + /health. Шейрим reqwest-клиент с CH
-    // только для table-breakdown (best-effort). Падение этого запроса
-    // не валит endpoint — sysmetrics просто отдаёт metrics без таблиц.
+    // REST: /v1/system/metrics + /health + /v1/clusters/range. Один
+    // reqwest-клиент шейрится между sysmetrics (table-breakdown) и
+    // cluster_history (выдача баров терминалу). Pool keep-alive снизит
+    // overhead при частых /range запросах от UI.
+    let ch_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .pool_max_idle_per_host(8)
+        .build()
+        .context("build reqwest client for REST→CH")?;
+
     let sysmetrics_state = cluster_api::SysMetricsState {
-        ch_client: Some(
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .context("build reqwest client for sysmetrics")?,
-        ),
+        ch_client: Some(ch_http.clone()),
         ch_url: ingest.clickhouse_url.clone(),
         ch_database: ingest.clickhouse_database.clone(),
     };
+    let history_state = cluster_api::ClusterHistoryState {
+        ch_client: ch_http,
+        ch_url: ingest.clickhouse_url.clone(),
+        ch_database: ingest.clickhouse_database.clone(),
+        // Пока пишем как default-пользователь — наш ingest подключается
+        // тем же способом (sink также без auth). Если позже поднимем
+        // отдельного `cluster`-юзера с паролем — пробросим через env
+        // (CH_USER/CH_PASSWORD).
+        ch_user: std::env::var("CH_USER").unwrap_or_default(),
+        ch_password: std::env::var("CH_PASSWORD").unwrap_or_default(),
+    };
     let rest_auth = auth_state.clone();
     let rest_handle = tokio::spawn(async move {
-        if let Err(e) = cluster_api::serve_rest(rest_addr, sysmetrics_state, rest_auth).await {
+        if let Err(e) =
+            cluster_api::serve_rest(rest_addr, sysmetrics_state, history_state, rest_auth).await
+        {
             tracing::error!(error = %e, "REST server crashed");
         }
     });

@@ -454,28 +454,9 @@ impl Default for BinancePerpConfig {
     }
 }
 
-/// Имя таблицы в ClickHouse для конкретного таймфрейма.
-///
-/// Конвенция фиксированная: `clusters_<human>` где `<human>` =
-/// `30s | 1m | 5m | 15m | 1h | 4h | 1d` для стандартных значений; для
-/// произвольных секунд — `clusters_<N>s`. Привязана к миграциям —
-/// если поменяешь схему имен, обнови `migrations/003_timeframes.sql`.
-pub fn table_name_for(interval_seconds: u32) -> String {
-    let human = match interval_seconds {
-        30 => "30s".to_string(),
-        60 => "1m".to_string(),
-        300 => "5m".to_string(),
-        900 => "15m".to_string(),
-        3600 => "1h".to_string(),
-        14400 => "4h".to_string(),
-        86400 => "1d".to_string(),
-        n if n % 86400 == 0 => format!("{}d", n / 86400),
-        n if n % 3600 == 0 => format!("{}h", n / 3600),
-        n if n % 60 == 0 => format!("{}m", n / 60),
-        n => format!("{n}s"),
-    };
-    format!("clusters_{human}")
-}
+// table_name_for / SUPPORTED_INTERVALS живут в cluster_api::timeframes —
+// один источник правды для ingest-стороны и REST-handler'а.
+pub use cluster_api::timeframes::table_name_for;
 
 impl IngestConfig {
     pub fn agg_tick_interval(&self) -> Duration {
