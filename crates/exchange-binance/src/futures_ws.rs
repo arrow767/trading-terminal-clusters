@@ -1,6 +1,15 @@
 use exchange_core::{PingKind, SymbolSpec, WsConnector};
 
-const DEFAULT_WS_URL: &str = "wss://fstream.binance.com/stream";
+/// USD-M futures combined-stream WebSocket. As of 2026-05 Binance routes
+/// streams via prefixed paths: `/market/`, `/public/`, `/private/`.
+/// Connections without a routed prefix (the historical
+/// `wss://fstream.binance.com/stream`) accept SUBSCRIBE and return an
+/// ack, but **silently deliver no market frames** — confirmed empirically
+/// on this codebase (ack ok, zero aggTrade frames in 8s).
+///
+/// Use `/market/stream` for the combined-stream subscribe-method protocol.
+/// Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams
+const DEFAULT_WS_URL: &str = "wss://fstream.binance.com/market/stream";
 
 /// `WsConnector` for Binance USD-M futures combined-stream endpoint.
 ///
