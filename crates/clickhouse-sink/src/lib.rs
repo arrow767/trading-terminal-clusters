@@ -125,6 +125,37 @@ impl ChWriter {
         Ok(Self { cfg, client })
     }
 
+    pub fn config(&self) -> &ChWriterConfig {
+        &self.cfg
+    }
+
+    /// Выполнить произвольный DDL-запрос (например, `ALTER TABLE … MODIFY TTL …`)
+    /// через тот же HTTP-клиент. Используется ingest-startup'ом чтобы
+    /// синхронизировать TTL таблицы с RetentionConfig — менять retention
+    /// без миграций / cron'а / ручного захода в ClickHouse.
+    ///
+    /// На пустую/успешную HTTP-200 ClickHouse возвращает пустое тело —
+    /// мы это нормально обрабатываем. На ошибку отдаём детальное тело,
+    /// чтобы оператор сразу увидел причину (например `Code: 159, e.what()
+    /// = DB::Exception: Cannot parse TTL expression`).
+    pub async fn execute_ddl(&self, sql: &str) -> Result<()> {
+        let url = self.cfg.url.trim_end_matches('/').to_string();
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(sql.to_string())
+            .send()
+            .await
+            .context("ch http send (ddl)")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("CH HTTP {status} on DDL: {detail}"));
+        }
+        Ok(())
+    }
+
     /// Pull rows off `rx`, batch them, and POST to ClickHouse. Returns
     /// when the channel closes, after flushing any in-flight batch.
     /// On a flush error, the batch is **kept** rather than dropped — the

@@ -23,8 +23,10 @@ CREATE TABLE IF NOT EXISTS clusters.clusters_1m (
 ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(window_start)
 ORDER BY (exchange, market_type, quote, symbol, window_start, price)
-TTL toDateTime(window_start) + INTERVAL 90 DAY TO VOLUME 'cold',
-    toDateTime(window_start) + INTERVAL 3 YEAR DELETE
+-- TTL намеренно НЕ задан здесь: его выставляет cluster-ingest на старте
+-- через `ALTER TABLE … MODIFY TTL …` на основе [ingest.retention]
+-- (default_days + per-(exchange,market_type) overrides). Один источник
+-- правды для retention — TOML конфига, не миграция.
 SETTINGS
     storage_policy = 'hot_cold',
     index_granularity = 8192,

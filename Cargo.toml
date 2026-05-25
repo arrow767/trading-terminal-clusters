@@ -33,11 +33,13 @@ dashmap = "6"
 crc32fast = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
-tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost", "gzip"] }
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3"
+axum = { version = "0.7", features = ["macros"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 
 [workspace.lints.rust]
 unused_must_use = "deny"

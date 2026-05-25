@@ -13,9 +13,13 @@
 //!
 //! Env knobs:
 //!   CLUSTER_GRPC=http://127.0.0.1:50051
+//!   CLUSTER_TOKEN=<bearer>  Bearer-токен для auth-protected серверов.
+//!                           На локальном dev без auth — оставь пустым.
 //!   EXCHANGE=BINANCEF       (Exchange::wire_id())
 //!   MARKET_TYPE=PERP        ("PERP" or "SPOT")
 //!   SYMBOL=BTCUSDT,ETHUSDT  (comma-separated, all on the same exchange)
+//!   INTERVAL=60             Таймфрейм в секундах: 30, 60, 300, 900, 3600, 14400, 86400.
+//!                           Должен совпадать с одним из `timeframes_secs` сервера.
 
 use anyhow::{anyhow, Context, Result};
 use cluster_api::proto;
@@ -42,18 +46,43 @@ async fn main() -> Result<()> {
         return Err(anyhow!("no symbols specified"));
     }
 
+    let interval_seconds: u32 = std::env::var("INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
     println!(
-        "connecting to {endpoint}; subscribing to {}/{} {:?}",
+        "connecting to {endpoint}; subscribing to {}/{} {:?} @ {}s (gzip)",
         exchange,
         market_type,
-        symbols.iter().map(|s| &s.symbol).collect::<Vec<_>>()
+        symbols.iter().map(|s| &s.symbol).collect::<Vec<_>>(),
+        interval_seconds
     );
 
+    let token = std::env::var("CLUSTER_TOKEN").ok().filter(|t| !t.is_empty());
+
+    // gzip — снижает per-frame size на типичных снапшотах (много i64)
+    // в 3-5 раз. Сервер уже передаёт gzip; клиент должен явно сказать
+    // что принимает (accept_compressed) и хочет слать сжатое (send_compressed,
+    // мелочь для subscribe-запроса, но включаем для симметрии).
     let mut client = ClusterStreamClient::connect(endpoint.clone())
         .await
-        .with_context(|| format!("connect to {endpoint}"))?;
+        .with_context(|| format!("connect to {endpoint}"))?
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
 
-    let req = proto::SubscribeRequest { symbols };
+    let mut req = tonic::Request::new(proto::SubscribeRequest {
+        symbols,
+        interval_seconds,
+    });
+    if let Some(t) = &token {
+        let header = format!("Bearer {t}");
+        req.metadata_mut().insert(
+            "authorization",
+            header
+                .parse()
+                .context("invalid CLUSTER_TOKEN (must be ASCII)")?,
+        );
+    }
     let mut stream = client
         .subscribe(req)
         .await

@@ -17,6 +17,12 @@ service ClusterStream {
 
 message SubscribeRequest {
   repeated SymbolKey symbols = 1;
+  // Aggregation timeframe in seconds (30, 60, 300, 900, 3600, 14400, 86400).
+  // 0 or unset → server defaults to 60 (back-compat with pre-multi-TF
+  // clients). Server publishes frames at this granularity for ALL
+  // requested symbols — mixing TFs in one Subscribe requires multiple
+  // Subscribe calls.
+  uint32 interval_seconds = 2;
 }
 
 // Wire ids: exchange uses Exchange::wire_id() ("BINANCEF", "BYBITF", ...);

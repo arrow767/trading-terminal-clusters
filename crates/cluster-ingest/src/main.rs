@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,13 +8,14 @@ use clickhouse_sink::{ChWriter, ChWriterConfig};
 use cluster_engine::ClusterBus;
 use exchange_binance::BinanceFuturesInfo;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 mod binance_session;
 mod binance_supervisor;
 mod config;
 
 use binance_supervisor::BinanceSupervisor;
-use config::Config;
+use config::{table_name_for, Config};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,36 +49,136 @@ async fn main() -> Result<()> {
     if let Ok(listen) = std::env::var("INGEST_GRPC_LISTEN") {
         ingest.grpc_listen = listen;
     }
+    if let Ok(listen) = std::env::var("INGEST_REST_LISTEN") {
+        ingest.rest_listen = listen;
+    }
+
+    // Bearer-токены: применяем env-overrides и валидируем — лучше упасть
+    // на старте, чем потом обнаружить что сервис открыт всему интернету.
+    ingest.auth.apply_env();
+    ingest
+        .auth
+        .validate()
+        .context("invalid [ingest.auth] config")?;
+    let auth_state =
+        cluster_api::AuthState::new(ingest.auth.tokens.clone(), ingest.auth.enabled);
+    if auth_state.is_enabled() {
+        tracing::info!(
+            tokens = ingest.auth.tokens.len(),
+            "bearer auth enabled for gRPC + REST"
+        );
+    } else {
+        tracing::warn!("bearer auth DISABLED — сервис открыт; включи [ingest.auth].enabled в prod");
+    }
+
+    // Валидируем timeframes и retention заранее — если конфиг сломан,
+    // лучше упасть на старте, чем после первого `ALTER`/`INSERT`.
+    ingest
+        .validate_timeframes()
+        .context("invalid [ingest] timeframes_secs")?;
+    ingest
+        .retention
+        .validate()
+        .context("invalid [ingest.retention] config")?;
 
     let bus = Arc::new(ClusterBus::new());
-    let (ch_tx, ch_rx) = mpsc::channel(ingest.ch_channel_bound);
 
     let grpc_addr: SocketAddr = ingest
         .grpc_listen
         .parse()
         .with_context(|| format!("parse grpc_listen: {}", ingest.grpc_listen))?;
+    let rest_addr: SocketAddr = ingest
+        .rest_listen
+        .parse()
+        .with_context(|| format!("parse rest_listen: {}", ingest.rest_listen))?;
     let grpc_bus = Arc::clone(&bus);
+    let grpc_auth = auth_state.clone();
     let grpc_handle = tokio::spawn(async move {
-        if let Err(e) = cluster_api::serve(grpc_bus, grpc_addr).await {
+        if let Err(e) = cluster_api::serve_with_auth(grpc_bus, grpc_addr, grpc_auth).await {
             tracing::error!(error = %e, "gRPC server crashed");
         }
     });
 
-    let ch_writer = ChWriter::new(ChWriterConfig {
-        url: ingest.clickhouse_url.clone(),
-        ..ChWriterConfig::default()
-    })
-    .context("build ChWriter")?;
-    let writer_handle = tokio::spawn(async move {
-        match ch_writer.run(ch_rx).await {
-            Ok(stats) => tracing::info!(?stats, "ch writer ended"),
-            Err(e) => tracing::error!(error = %e, "ch writer crashed"),
+    // REST: /v1/system/metrics + /health. Шейрим reqwest-клиент с CH
+    // только для table-breakdown (best-effort). Падение этого запроса
+    // не валит endpoint — sysmetrics просто отдаёт metrics без таблиц.
+    let sysmetrics_state = cluster_api::SysMetricsState {
+        ch_client: Some(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .context("build reqwest client for sysmetrics")?,
+        ),
+        ch_url: ingest.clickhouse_url.clone(),
+        ch_database: ingest.clickhouse_database.clone(),
+    };
+    let rest_auth = auth_state.clone();
+    let rest_handle = tokio::spawn(async move {
+        if let Err(e) = cluster_api::serve_rest(rest_addr, sysmetrics_state, rest_auth).await {
+            tracing::error!(error = %e, "REST server crashed");
         }
     });
 
+    // По одному ChWriter на каждый TF — пишет в свою таблицу `clusters_<tf>`.
+    // Канал по таймфрейму отдельный, чтобы один медленный TF не давил
+    // на остальные через общий bound.
+    let mut ch_tx_by_tf: HashMap<u32, mpsc::Sender<clickhouse_sink::ClusterRow>> = HashMap::new();
+    let mut writer_handles: Vec<JoinHandle<()>> = Vec::new();
+    for &tf_secs in &ingest.timeframes_secs {
+        let (tx, rx) = mpsc::channel(ingest.ch_channel_bound);
+        let table = table_name_for(tf_secs);
+        let writer = ChWriter::new(ChWriterConfig {
+            url: ingest.clickhouse_url.clone(),
+            database: ingest.clickhouse_database.clone(),
+            table: table.clone(),
+            ..ChWriterConfig::default()
+        })
+        .with_context(|| format!("build ChWriter for {table}"))?;
+
+        // Apply retention для этой таблицы. Failure non-fatal: ingest
+        // продолжит писать, TTL просто останется прежним (видно по
+        // /v1/system/metrics → table-breakdown).
+        if ingest.retention.apply_on_start {
+            if let Some(clause) = ingest.retention.ttl_clause_for(tf_secs) {
+                let sql = format!(
+                    "ALTER TABLE {}.{} MODIFY TTL {}",
+                    ingest.clickhouse_database, table, clause
+                );
+                tracing::info!(%table, %sql, "applying retention TTL");
+                if let Err(e) = writer.execute_ddl(&sql).await {
+                    tracing::warn!(
+                        error = %e, %table,
+                        "MODIFY TTL failed; ingest will continue with existing TTL"
+                    );
+                } else {
+                    tracing::info!(
+                        %table,
+                        interval_seconds = tf_secs,
+                        "retention TTL applied"
+                    );
+                }
+            } else {
+                tracing::info!(
+                    %table,
+                    "retention для этой TF отключена целиком — TTL не трогаю"
+                );
+            }
+        }
+
+        let handle = tokio::spawn(async move {
+            match writer.run(rx).await {
+                Ok(stats) => tracing::info!(?stats, %table, "ch writer ended"),
+                Err(e) => tracing::error!(error = %e, %table, "ch writer crashed"),
+            }
+        });
+        writer_handles.push(handle);
+        ch_tx_by_tf.insert(tf_secs, tx);
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let supervisor_task = if binance_cfg.enabled {
+    let binance_enabled = ingest.is_exchange_enabled("binance_perp", binance_cfg.enabled);
+    let supervisor_task = if binance_enabled {
         // One Arc, two trait views: ExchangeInfo for symbol discovery,
         // VolumeRanker for top-N ordering. Sharing the underlying
         // BinanceFuturesInfo keeps the reqwest client (with its
@@ -91,7 +193,7 @@ async fn main() -> Result<()> {
             ingest.region.clone(),
             ingest.clone(),
             binance_cfg,
-            ch_tx.clone(),
+            ch_tx_by_tf.clone(),
         );
         let shutdown_for_sup = shutdown_rx.clone();
         Some(tokio::spawn(async move {
@@ -102,25 +204,27 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Drop the local copy so once supervisor's spawn_symbol clones are
-    // also dropped (during shutdown), the writer's receiver closes and
-    // writer_handle returns cleanly.
-    drop(ch_tx);
+    // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а
+    // (когда его собственные клоны тоже дропнутся) writer'ы увидели close
+    // и завершились корректно.
+    drop(ch_tx_by_tf);
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("ctrl-c received; signalling shutdown");
-        }
-        r = writer_handle => {
-            tracing::warn!(result = ?r, "writer task ended unexpectedly");
-        }
-    }
+    // Раньше main селективился на одном writer_handle, чтобы заметить
+    // его падение. С N writer'ами select_all усложняет код без выгоды:
+    // упавший writer и так логируется внутри своей spawn-блока, а exit-
+    // сигнал у нас есть (ctrl_c).
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("ctrl-c received; signalling shutdown");
 
     let _ = shutdown_tx.send(true);
     if let Some(t) = supervisor_task {
         let _ = t.await;
     }
     grpc_handle.abort();
+    rest_handle.abort();
+    for h in writer_handles {
+        h.abort();
+    }
 
     Ok(())
 }

@@ -5,14 +5,16 @@ use std::sync::Arc;
 use cluster_engine::ClusterBus;
 use exchange_core::{
     AnalyticsDiff, AnalyticsSnapshot, ClusterBucket, ClusterFrame, Exchange, MarketType,
-    SymbolKey as DomainSymbolKey,
+    StreamKey as DomainStreamKey, SymbolKey as DomainSymbolKey,
 };
 use futures_util::Stream;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::StreamExt;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{grpc_auth_interceptor, AuthState};
 use crate::proto;
 use crate::proto::cluster_stream_server::{ClusterStream, ClusterStreamServer};
 
@@ -49,20 +51,33 @@ impl ClusterStream for ClusterStreamService {
                 "too many symbols in one subscribe (max 1024)",
             ));
         }
+        // 0 / unset → дефолт 60s (back-compat). Конкретный TF клиента
+        // мы НЕ валидируем по списку доступных (ingest может работать с
+        // подмножеством TF) — если канал не имеет publisher'а, клиент
+        // просто будет ждать первого кадра в bus, который никогда не
+        // придёт. Это допустимо: ranger операции на subscribe-стороне
+        // лежат в логике клиента, не сервера.
+        let interval_seconds = if req.interval_seconds == 0 {
+            60
+        } else {
+            req.interval_seconds
+        };
 
         let mut per_symbol_streams = Vec::with_capacity(req.symbols.len());
         for sym in req.symbols {
-            let key = symbol_key_from_proto(&sym)?;
-            let rx = self.bus.subscribe(&key);
-            let proto_key = proto_key_from_domain(&key);
-            // BroadcastStream reports lag with `Lagged(n)`; we filter it
-            // out and continue. A lagged client misses frames but will
-            // resync at the next window-roll snapshot — preferable to
-            // tearing down the stream and forcing a full reconnect.
+            let symbol_key = symbol_key_from_proto(&sym)?;
+            let stream_key = DomainStreamKey::new(symbol_key.clone(), interval_seconds);
+            let rx = self.bus.subscribe(&stream_key);
+            let proto_key = proto_key_from_domain(&symbol_key);
             let s = BroadcastStream::new(rx).filter_map(move |r| match r {
                 Ok(frame) => Some(Ok(frame_to_proto(&proto_key, &frame))),
                 Err(BroadcastStreamRecvError::Lagged(n)) => {
-                    tracing::warn!(lagged = n, symbol = %proto_key.symbol, "client lagged");
+                    tracing::warn!(
+                        lagged = n,
+                        symbol = %proto_key.symbol,
+                        interval_seconds,
+                        "client lagged"
+                    );
                     None
                 }
             });
@@ -75,11 +90,33 @@ impl ClusterStream for ClusterStreamService {
 }
 
 /// Run a tonic gRPC server on `addr` exposing ClusterStream over the
-/// provided bus. Returns when the server task finishes (or errors).
+/// provided bus. Без авторизации — оставлено для обратной совместимости
+/// с unit-тестами и dev-режимом. Прод-код должен звать `serve_with_auth`.
 pub async fn serve(bus: Arc<ClusterBus>, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
-    let svc = ClusterStreamService::new(bus).into_server();
-    tracing::info!(%addr, "cluster-api: gRPC server listening");
-    Server::builder().add_service(svc).serve(addr).await
+    serve_with_auth(bus, addr, AuthState::disabled()).await
+}
+
+/// Запустить gRPC-сервер ClusterStream с bearer-перехватчиком. Если
+/// `auth.is_enabled()` = false, перехватчик пропустит всё (используется
+/// в dev). На enabled — `Subscribe` без валидного `authorization`
+/// metadata вернёт `unauthenticated`.
+pub async fn serve_with_auth(
+    bus: Arc<ClusterBus>,
+    addr: SocketAddr,
+    auth: AuthState,
+) -> Result<(), tonic::transport::Error> {
+    use tonic::service::interceptor::InterceptedService;
+    let svc = ClusterStreamService::new(bus);
+    // Сначала включаем gzip на «голом» Server (это его метод, не у
+    // InterceptedService), потом оборачиваем bearer-перехватчиком.
+    // gzip жмёт snapshot/diff кадры (массивы int64) в 3-5×; стоимость
+    // CPU на сервере минимальна.
+    let server = ClusterStreamServer::new(svc)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip);
+    let intercepted = InterceptedService::new(server, grpc_auth_interceptor(auth));
+    tracing::info!(%addr, "cluster-api: gRPC server listening (gzip enabled)");
+    Server::builder().add_service(intercepted).serve(addr).await
 }
 
 // `tonic::Status` is large (~176 bytes) — boxing it everywhere just to
@@ -196,6 +233,10 @@ mod tests {
         DomainSymbolKey::new(Exchange::BinanceF, MarketType::Perp, "BTCUSDT")
     }
 
+    fn stream_key(tf: u32) -> DomainStreamKey {
+        DomainStreamKey::new(key(), tf)
+    }
+
     fn snapshot_frame(seq: i64) -> ClusterFrame {
         ClusterFrame::Snapshot(Arc::new(AnalyticsSnapshot {
             window_start_ns: 1_700_000_000_000_000_000,
@@ -235,6 +276,7 @@ mod tests {
                 market_type: "PERP".into(),
                 symbol: "BTCUSDT".into(),
             }],
+            interval_seconds: 60,
         };
         let mut stream = client.subscribe(req).await.unwrap().into_inner();
 
@@ -242,7 +284,7 @@ mod tests {
         // publish, otherwise the publish may happen before the broadcast
         // receiver is allocated.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        bus.publish(&key(), snapshot_frame(7));
+        bus.publish(&stream_key(60), snapshot_frame(7));
 
         let frame = tokio::time::timeout(Duration::from_secs(2), stream.message())
             .await
@@ -283,11 +325,82 @@ mod tests {
         let mut client = ClusterStreamClient::connect(format!("http://{addr}"))
             .await
             .unwrap();
-        let req = proto::SubscribeRequest { symbols: vec![] };
+        let req = proto::SubscribeRequest {
+            symbols: vec![],
+            interval_seconds: 0,
+        };
         let r = client.subscribe(req).await;
         let err = r.expect_err("should reject empty list");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_requires_bearer_when_auth_enabled() {
+        let bus = Arc::new(ClusterBus::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let auth = AuthState::new(vec!["the-secret".into()], true);
+        let bus_for_server = Arc::clone(&bus);
+        let server_handle = tokio::spawn(async move {
+            serve_with_auth(bus_for_server, addr, auth).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = ClusterStreamClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        // Без метаданных → unauthenticated.
+        let req = proto::SubscribeRequest {
+            symbols: vec![proto::SymbolKey {
+                exchange: "BINANCEF".into(),
+                market_type: "PERP".into(),
+                symbol: "BTCUSDT".into(),
+            }],
+            interval_seconds: 0,
+        };
+        let r = client.subscribe(req).await;
+        let err = r.expect_err("must reject without bearer");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_accepts_correct_bearer() {
+        let bus = Arc::new(ClusterBus::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let auth = AuthState::new(vec!["the-secret".into()], true);
+        let bus_for_server = Arc::clone(&bus);
+        let server_handle = tokio::spawn(async move {
+            serve_with_auth(bus_for_server, addr, auth).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = ClusterStreamClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let mut req = tonic::Request::new(proto::SubscribeRequest {
+            symbols: vec![proto::SymbolKey {
+                exchange: "BINANCEF".into(),
+                market_type: "PERP".into(),
+                symbol: "BTCUSDT".into(),
+            }],
+            interval_seconds: 0,
+        });
+        req.metadata_mut().insert(
+            "authorization",
+            "Bearer the-secret".parse().unwrap(),
+        );
+        // Запрос должен пройти валидацию auth — дальше unrelated к токену
+        // ошибок быть не должно.
+        client.subscribe(req).await.unwrap();
         server_handle.abort();
     }
 
@@ -313,10 +426,61 @@ mod tests {
                 market_type: "PERP".into(),
                 symbol: "BTCUSDT".into(),
             }],
+            interval_seconds: 60,
         };
         let r = client.subscribe(req).await;
         let err = r.expect_err("should reject unknown exchange");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_routes_to_correct_timeframe_channel() {
+        // 30s и 1m кадры на одном символе — разные bus-каналы. Клиент,
+        // подписавшийся на interval_seconds=30, должен получать ТОЛЬКО
+        // 30s кадры, не 1m.
+        let bus = Arc::new(ClusterBus::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let bus_for_server = Arc::clone(&bus);
+        let server_handle = tokio::spawn(async move {
+            serve(bus_for_server, addr).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = ClusterStreamClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let req = proto::SubscribeRequest {
+            symbols: vec![proto::SymbolKey {
+                exchange: "BINANCEF".into(),
+                market_type: "PERP".into(),
+                symbol: "BTCUSDT".into(),
+            }],
+            interval_seconds: 30,
+        };
+        let mut stream = client.subscribe(req).await.unwrap().into_inner();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Публикуем на 60s — клиент НЕ должен получить.
+        bus.publish(&stream_key(60), snapshot_frame(100));
+        let got = tokio::time::timeout(Duration::from_millis(200), stream.message()).await;
+        assert!(got.is_err(), "1m frame must not leak to 30s subscriber");
+
+        // Публикуем на 30s — должен получить.
+        bus.publish(&stream_key(30), snapshot_frame(7));
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let body = frame.body.unwrap();
+        match body {
+            proto::frame::Body::Snapshot(s) => assert_eq!(s.sequence, 7),
+            _ => panic!("expected snapshot body"),
+        }
 
         server_handle.abort();
     }

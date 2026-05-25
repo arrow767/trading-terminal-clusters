@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use exchange_core::TradePrint;
+use exchange_core::{StreamKey, TradePrint};
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -10,14 +10,17 @@ use crate::bus::ClusterBus;
 
 /// Drives one `Aggregator` to completion: pulls trades from `trades`,
 /// pulses `Aggregator::tick` on `tick_interval`, and publishes every
-/// emitted frame onto `bus`. Returns when the trade channel closes.
+/// emitted frame onto `bus` под ключом `stream_key` (symbol + interval).
+/// `interval_seconds` в StreamKey должен соответствовать `window_ms` агрегатора
+/// (это инвариант, supervisor выставляет их парами).
+/// Returns when the trade channel closes.
 pub async fn run_aggregator(
     mut agg: Aggregator,
+    stream_key: StreamKey,
     mut trades: mpsc::Receiver<TradePrint>,
     bus: Arc<ClusterBus>,
     tick_interval: Duration,
 ) {
-    let key = agg.key().clone();
     let mut ticker = interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -28,12 +31,12 @@ pub async fn run_aggregator(
                 match maybe_trade {
                     Some(trade) => {
                         if let Some(frame) = agg.ingest(trade) {
-                            bus.publish(&key, frame);
+                            bus.publish(&stream_key, frame);
                         }
                     }
                     None => {
                         if let Some(frame) = agg.flush() {
-                            bus.publish(&key, frame);
+                            bus.publish(&stream_key, frame);
                         }
                         break;
                     }
@@ -41,7 +44,7 @@ pub async fn run_aggregator(
             }
             _ = ticker.tick() => {
                 if let Some(frame) = agg.tick(now_ns()) {
-                    bus.publish(&key, frame);
+                    bus.publish(&stream_key, frame);
                 }
             }
         }
@@ -58,21 +61,23 @@ fn now_ns() -> i64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use exchange_core::{AggressorSide, ClusterFrame, Exchange, MarketType, SymbolKey};
+    use exchange_core::{AggressorSide, ClusterFrame, Exchange, MarketType, StreamKey, SymbolKey};
 
     use super::*;
 
     #[tokio::test]
     async fn task_publishes_closing_snapshot_on_window_roll() {
         let bus = Arc::new(ClusterBus::new());
-        let key = SymbolKey::new(Exchange::BinanceF, MarketType::Perp, "BTCUSDT");
-        let mut rx = bus.subscribe(&key);
+        let sym = SymbolKey::new(Exchange::BinanceF, MarketType::Perp, "BTCUSDT");
+        let stream_key = StreamKey::new(sym.clone(), 60);
+        let mut rx = bus.subscribe(&stream_key);
 
-        let agg = Aggregator::new(key.clone(), 10, 60_000, 100);
+        let agg = Aggregator::new(sym, 10, 60_000, 100);
         let (tx, rx_trades) = mpsc::channel(16);
         let bus_clone = Arc::clone(&bus);
+        let stream_key_clone = stream_key.clone();
         let handle = tokio::spawn(async move {
-            run_aggregator(agg, rx_trades, bus_clone, Duration::from_millis(50)).await;
+            run_aggregator(agg, stream_key_clone, rx_trades, bus_clone, Duration::from_millis(50)).await;
         });
 
         tx.send(TradePrint {

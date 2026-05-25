@@ -1,0 +1,165 @@
+# Example configuration for cluster-ingest.
+#
+# Запуск: INGEST_CONFIG=/path/to/cluster-ingest.toml cargo run -p cluster-ingest
+#
+# Все поля имеют дефолты (см. src/config.rs); конфиг можно сократить до
+# нужных секций. Пропущенные поля = дефолт. Неизвестные ключи
+# принимаются и игнорируются (forward-compat).
+
+[ingest]
+# Регион для тэгирования строк в ClickHouse — нужен для сравнения
+# дублей Tokyo vs Singapore.
+region = "tokyo"
+
+# HTTP endpoint ClickHouse. Можно переопределить через env CH_URL.
+clickhouse_url = "http://127.0.0.1:8123"
+clickhouse_database = "clusters"
+# clickhouse_table — legacy, игнорируется в multi-TF режиме. Таблицы
+# теперь именуются `clusters_<tf>` (см. config::table_name_for).
+clickhouse_table = "clusters_1m"
+
+# Таймфреймы для агрегации (в секундах). Каждый TF — отдельный аггрегатор
+# на каждый символ и отдельная таблица `clusters_<tf>` в ClickHouse.
+# Стандартный набор (он же full набор, который умеет миграция 003):
+#   [30, 60, 300, 900, 3600, 14400, 86400]   = 30s,1m,5m,15m,1h,4h,1d
+# Минимум — [60] (старая 1m-only схема для back-compat).
+# Можно подмножество: [30, 60, 3600] — только 30s+1m+1h.
+timeframes_secs = [30, 60, 300, 900, 3600, 14400, 86400]
+
+# Legacy глобальный window_ms — игнорируется когда задан timeframes_secs.
+window_ms = 60000
+diff_interval_ms = 200
+agg_tick_interval_ms = 100
+trade_channel_bound = 4096
+ch_channel_bound = 16384
+
+# gRPC ClusterStream listener. INGEST_GRPC_LISTEN перебивает.
+grpc_listen = "127.0.0.1:50051"
+
+# REST listener (/v1/system/metrics + /health). 127.0.0.1 по умолчанию,
+# чтобы reverse-proxy терминировал TLS и решал, что выпускать наружу.
+# Для прямого деплоя в облаке (как у OI) — "0.0.0.0:8080".
+# INGEST_REST_LISTEN перебивает.
+rest_listen = "127.0.0.1:8080"
+
+# Bearer-токен авторизация. Защищает gRPC ClusterStream и REST
+# /v1/system/metrics от случайного публичного трафика и DoS-ботов.
+#
+# В prod-deploy токен НЕ кладётся в этот файл — используй env
+# CLUSTER_INGEST_TOKEN (добавится в список) и CLUSTER_INGEST_AUTH_ENABLED=1.
+# При enabled=true с пустым tokens сервис откажется стартовать.
+[ingest.auth]
+enabled = true
+# Сгенерированный пример. Перегенерируй своим, например:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+tokens = ["REPLACE_ME_WITH_A_LONG_RANDOM_TOKEN"]
+
+# Whitelist бирж, которые этот процесс ingest должен поднимать.
+# Если пустой (комментарий или []), используется per-section `enabled`
+# флаг внутри [ingest.exchanges.*]. Если непустой — авторитет здесь:
+# секция, не упомянутая в списке, не стартует даже с `enabled = true`.
+#
+# Поддерживаемые имена (сейчас в коде):
+#   - "binance_perp"
+# Будущие: "bybit_perp", "okx_perp", "bitget_perp", "mexc_perp", ...
+enabled_exchanges = ["binance_perp"]
+
+# Retention — сколько хранить строки в каждой таблице clusters_<tf>.
+# На старте ingest выпускает по `ALTER TABLE … MODIFY TTL …` per-table —
+# CH удалит старые партиции фоновым merge'ом. Никакого cron-job не нужно.
+#
+# Гранулярность правил:
+#   * `default_days` — для (exchange, market_type, TF) не упомянутых в override.
+#   * `[[ingest.retention.override]]` — точечно:
+#       - без `interval_seconds`  →  правило для ВСЕХ TF этой пары;
+#       - с `interval_seconds = N` → ТОЛЬКО таблица `clusters_<N>`.
+#     Точечное правило (с interval_seconds) перебивает глобальное (без).
+#   * `days = 0` → forever (срез никогда не удаляется автоматически).
+#   * `move_to_cold_days` применяется к default-срезу каждой TF (cold-tier
+#     по override'ам не имеет смысла на таких объёмах).
+[ingest.retention]
+default_days = 7
+apply_on_start = true
+# move_to_cold_days = 3
+
+# Примеры точечных правил. Биржи в UPPER (Exchange::wire_id):
+#   BINANCE, BINANCEF, BYBIT, BYBITF, OKX, OKXF, BITGET, BITGETF,
+#   KUCOIN, KUCOINF, HYPERLIQUID, GATE, GATEF
+# market_type — lowercase: "spot" | "perp"
+
+# === Per-(биржа, рынок), все TF: ===
+# Binance USDT-perp хранить 30 дней.
+[[ingest.retention.override]]
+exchange = "BINANCEF"
+market_type = "perp"
+days = 30
+
+# Bybit perp — неделю.
+[[ingest.retention.override]]
+exchange = "BYBITF"
+market_type = "perp"
+days = 7
+
+# OKX perp — 5 дней.
+[[ingest.retention.override]]
+exchange = "OKXF"
+market_type = "perp"
+days = 5
+
+# Binance spot — forever.
+[[ingest.retention.override]]
+exchange = "BINANCE"
+market_type = "spot"
+days = 0
+
+# === Точечно по TF: ===
+# 30s-таблица Binance perp — диск ест больше всех, держим только сутки.
+# Перебивает глобальное правило "BINANCEF/perp = 30 дней" выше.
+[[ingest.retention.override]]
+exchange = "BINANCEF"
+market_type = "perp"
+interval_seconds = 30
+days = 1
+
+# 1h-таблица Binance perp — оставить навсегда (долгие исторические charts).
+[[ingest.retention.override]]
+exchange = "BINANCEF"
+market_type = "perp"
+interval_seconds = 3600
+days = 0
+
+# Параметры конкретной биржи. enabled здесь = sub-флаг; whitelist выше
+# имеет приоритет (см. is_exchange_enabled).
+[ingest.exchanges.binance_perp]
+enabled = true
+
+# Котировочные валюты — символы с другими quote'ами фильтруются.
+include_quotes = ["USDT", "USDC"]
+
+# Жёсткий allow-list: если непустой, ТОЛЬКО эти символы подписываются.
+# Удобно для dev. В prod — оставлять пустым, чтобы auto-discovery
+# подхватывал новые листинги.
+allow = []
+# allow = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+# Blacklist (имеет приоритет над allow / quote-фильтром).
+deny = []
+
+# Топ-N после ранжирования. None = брать всех; число = взять самых
+# объёмных (по rank_by). Top-50 USDT-perp — типичный prod-кейс.
+top_n = 50
+
+# Как ранжировать перед top_n cut:
+#   "alphabetical" — без сетевых вызовов, дешевле всего.
+#   "volume_24h"   — раз в discovery_poll_secs тянем /fapi/v1/ticker/24hr,
+#                    сортируем по quote-volume убыванию.
+rank_by = "volume_24h"
+
+# Раз в сколько секунд переопрашивать exchangeInfo и реконсилить набор
+# символов. Новые листинги появляются в подписке через ≤ этот интервал.
+discovery_poll_secs = 300
+
+# WS-параметры.
+ws_connect_timeout_ms = 15000
+reconnect_backoff_min_ms = 500
+reconnect_backoff_max_ms = 30000

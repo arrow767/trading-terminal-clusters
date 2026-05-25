@@ -125,6 +125,28 @@ impl SymbolKey {
     }
 }
 
+/// Bus-key для одного потока кадров: символ + конкретный таймфрейм
+/// (interval_seconds). Один и тот же символ при разных TF живёт на
+/// разных каналах, потому что аггрегаторы — независимые задачи, и
+/// подписчик (терминал/CH-fanout) хочет именно конкретную гранулярность.
+///
+/// `interval_seconds = 30` → база (то, что считает ingest напрямую).
+/// `interval_seconds = 60` → 1m аггрегатор, и т.д.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamKey {
+    pub symbol: SymbolKey,
+    pub interval_seconds: u32,
+}
+
+impl StreamKey {
+    pub fn new(symbol: SymbolKey, interval_seconds: u32) -> Self {
+        Self {
+            symbol,
+            interval_seconds,
+        }
+    }
+}
+
 /// Full state of the current (still-open) time window for one instrument.
 /// Wire-equivalent of fat-terminal's `AnalyticsSnapshot` (union id 104).
 #[derive(Debug, Clone, Serialize, Deserialize)]

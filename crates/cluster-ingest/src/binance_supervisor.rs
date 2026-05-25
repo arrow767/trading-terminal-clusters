@@ -7,7 +7,8 @@ use clickhouse_sink::{rows_from_snapshot, ClusterRow};
 use cluster_engine::{run_aggregator, Aggregator, ClusterBus};
 use exchange_binance::BinanceFuturesWs;
 use exchange_core::{
-    ClusterFrame, Exchange, ExchangeInfo, MarketType, Quote, SymbolKey, SymbolSpec, VolumeRanker,
+    ClusterFrame, Exchange, ExchangeInfo, MarketType, Quote, StreamKey, SymbolKey, SymbolSpec,
+    TradePrint, VolumeRanker,
 };
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
@@ -46,14 +47,22 @@ pub struct BinanceSupervisor {
     cfg: BinancePerpConfig,
     handles: Arc<RwLock<HashMap<SymbolKey, SymbolHandle>>>,
     routes_tx: watch::Sender<Vec<SymbolRoute>>,
-    ch_tx: mpsc::Sender<ClusterRow>,
+    /// Один writer-channel на каждый TF. Сборка в main.rs; supervisor
+    /// раздаёт клоны конкретных tx-каналов своим per-symbol per-TF fanout'ам.
+    /// Key = interval_seconds (как в `timeframes_secs`).
+    ch_tx_by_tf: Arc<HashMap<u32, mpsc::Sender<ClusterRow>>>,
 }
 
 struct SymbolHandle {
     spec: SymbolSpec,
-    trade_tx: mpsc::Sender<exchange_core::TradePrint>,
-    aggregator: JoinHandle<()>,
-    ch_fanout: JoinHandle<()>,
+    /// Куда session-loop пишет трейды этого символа.
+    trade_tx: mpsc::Sender<TradePrint>,
+    /// Per-symbol fanout: один tx сверху → N TF-каналов внутри.
+    fanout: JoinHandle<()>,
+    /// По одному аггрегатору на каждый таймфрейм.
+    aggregators: Vec<JoinHandle<()>>,
+    /// По одному CH-fanout'у (bus → ClusterRow writer mpsc) на каждый TF.
+    ch_fanouts: Vec<JoinHandle<()>>,
 }
 
 impl BinanceSupervisor {
@@ -64,7 +73,7 @@ impl BinanceSupervisor {
         region: String,
         ingest: IngestConfig,
         cfg: BinancePerpConfig,
-        ch_tx: mpsc::Sender<ClusterRow>,
+        ch_tx_by_tf: HashMap<u32, mpsc::Sender<ClusterRow>>,
     ) -> Self {
         let (routes_tx, _) = watch::channel(Vec::new());
         Self {
@@ -76,7 +85,7 @@ impl BinanceSupervisor {
             cfg,
             handles: Arc::new(RwLock::new(HashMap::new())),
             routes_tx,
-            ch_tx,
+            ch_tx_by_tf: Arc::new(ch_tx_by_tf),
         }
     }
 
@@ -120,13 +129,19 @@ impl BinanceSupervisor {
 
         tracing::info!("supervisor: shutting down");
         let mut handles = self.handles.write().await;
-        let mut joins = Vec::with_capacity(handles.len() * 2);
+        let mut joins: Vec<JoinHandle<()>> = Vec::new();
         for (_, handle) in handles.drain() {
-            // Dropping the sender closes the mpsc; aggregator task
-            // observes None on recv, flushes, and returns.
+            // Dropping session->fanout sender кидает domino:
+            // fanout видит None → дропает per-TF senders → каждый
+            // aggregator видит None → flush'ит финальный кадр в bus → bus
+            // отдаёт его ch_fanout subscriber'у. ch_fanouts мы аборт'им
+            // отдельно ниже — без abort'а они зависнут на bus.recv ().
             drop(handle.trade_tx);
-            handle.ch_fanout.abort();
-            joins.push(handle.aggregator);
+            for ch_fan in handle.ch_fanouts {
+                ch_fan.abort();
+            }
+            joins.push(handle.fanout);
+            joins.extend(handle.aggregators);
         }
         for j in joins {
             let _ = j.await;
@@ -163,7 +178,12 @@ impl BinanceSupervisor {
         for key in &to_remove {
             if let Some(handle) = h.remove(key) {
                 drop(handle.trade_tx);
-                handle.ch_fanout.abort();
+                for ch_fan in handle.ch_fanouts {
+                    ch_fan.abort();
+                }
+                // fanout + aggregators самозавершатся по domino-эффекту
+                // (см. shutdown-комментарий). Здесь не ждём — это горячий
+                // путь reconcile, блокировать его await'ом дорого.
                 tracing::info!(symbol = %key.symbol, "supervisor: removed delisted symbol");
             }
         }
@@ -233,32 +253,75 @@ impl BinanceSupervisor {
     }
 
     fn spawn_symbol(&self, spec: SymbolSpec) -> SymbolHandle {
-        let key = SymbolKey::new(spec.exchange, spec.market_type, spec.symbol.as_str());
+        let symbol_key = SymbolKey::new(spec.exchange, spec.market_type, spec.symbol.as_str());
         let bucket_step = spec.tick_size;
-        let (trade_tx, trade_rx) = mpsc::channel(self.ingest.trade_channel_bound);
-        let agg = Aggregator::new(
-            key.clone(),
-            bucket_step,
-            self.ingest.window_ms,
-            self.ingest.diff_interval_ms,
-        );
-        let bus_for_agg = Arc::clone(&self.bus);
         let tick = self.ingest.agg_tick_interval();
-        let aggregator = tokio::spawn(async move {
-            run_aggregator(agg, trade_rx, bus_for_agg, tick).await;
+        let diff_ms = self.ingest.diff_interval_ms;
+        let trade_bound = self.ingest.trade_channel_bound;
+
+        // По одному аггрегатору и одному CH-fanout'у на каждый TF.
+        let mut tf_trade_txs: Vec<mpsc::Sender<TradePrint>> = Vec::new();
+        let mut aggregators: Vec<JoinHandle<()>> = Vec::new();
+        let mut ch_fanouts: Vec<JoinHandle<()>> = Vec::new();
+
+        for &tf_secs in &self.ingest.timeframes_secs {
+            let (tf_tx, tf_rx) = mpsc::channel(trade_bound);
+            tf_trade_txs.push(tf_tx);
+
+            let window_ms = (tf_secs as i64) * 1000;
+            let agg = Aggregator::new(symbol_key.clone(), bucket_step, window_ms, diff_ms);
+            let stream_key = StreamKey::new(symbol_key.clone(), tf_secs);
+            let bus_for_agg = Arc::clone(&self.bus);
+            let stream_key_for_agg = stream_key.clone();
+            let agg_handle = tokio::spawn(async move {
+                run_aggregator(agg, stream_key_for_agg, tf_rx, bus_for_agg, tick).await;
+            });
+            aggregators.push(agg_handle);
+
+            // CH-fanout: подписываемся на bus для этой пары (symbol, tf),
+            // и пушим строки в writer-канал именно этой TF.
+            let ch_tx = self
+                .ch_tx_by_tf
+                .get(&tf_secs)
+                .cloned()
+                .expect("invariant: ch_tx_by_tf has all configured timeframes");
+            let ch_fan = spawn_snapshot_to_ch(
+                &self.bus,
+                stream_key,
+                spec.clone(),
+                self.region.clone(),
+                ch_tx,
+            );
+            ch_fanouts.push(ch_fan);
+        }
+
+        // Per-symbol trade fanout: получает трейд от session, раздаёт во
+        // все per-TF mpsc-каналы. try_send — чтобы ОДИН медленный TF
+        // не блокировал быстрые (то же поведение, что у session: лучше
+        // потерять кадр, чем застрять и получить WS-disconnect от Binance).
+        let (session_tx, mut session_rx) = mpsc::channel(trade_bound);
+        let symbol_for_log = spec.symbol.clone();
+        let fanout = tokio::spawn(async move {
+            while let Some(trade) = session_rx.recv().await {
+                for tx in &tf_trade_txs {
+                    if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(trade) {
+                        // Канал закрыт — этот TF-aggregator уже мёртв,
+                        // следующие итерации просто проходят мимо.
+                        // (Full → дропнули кадр, это OK.)
+                    }
+                }
+            }
+            tracing::debug!(symbol = %symbol_for_log, "trade fanout exiting");
+            // tf_trade_txs дропнутся вместе с этим scope → aggregators
+            // увидят close → flush + exit.
         });
-        let ch_fanout = spawn_snapshot_to_ch(
-            &self.bus,
-            &key,
-            spec.clone(),
-            self.region.clone(),
-            self.ch_tx.clone(),
-        );
+
         SymbolHandle {
             spec,
-            trade_tx,
-            aggregator,
-            ch_fanout,
+            trade_tx: session_tx,
+            fanout,
+            aggregators,
+            ch_fanouts,
         }
     }
 }
@@ -341,7 +404,19 @@ async fn run_session_loop(
             result = session => {
                 match result {
                     Ok(stats) => {
-                        tracing::info!(?stats, "session ended; reconnecting");
+                        tracing::info!(?stats, "session ended; reconnecting after min backoff");
+                        // Ждём минимальный backoff даже на «чистом» закрытии.
+                        // Binance закрывает сокет каждые 24h и при route-cycle —
+                        // без этой паузы мы могли бы войти в reconnect-loop
+                        // если REST-уровень (например subscribe_payload) сразу
+                        // фейлится после открытия. Шаг маленький (по умолчанию
+                        // 500мс), так что user-perceived latency не страдает.
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff_min) => {}
+                            _ = shutdown.changed() => {
+                                if *shutdown.borrow() { break; }
+                            }
+                        }
                         backoff = backoff_min;
                     }
                     Err(e) => {
@@ -364,12 +439,13 @@ async fn run_session_loop(
 
 fn spawn_snapshot_to_ch(
     bus: &Arc<ClusterBus>,
-    key: &SymbolKey,
+    stream_key: StreamKey,
     spec: SymbolSpec,
     region: String,
     ch_tx: mpsc::Sender<ClusterRow>,
 ) -> JoinHandle<()> {
-    let mut sub = bus.subscribe(key);
+    let mut sub = bus.subscribe(&stream_key);
+    let interval = stream_key.interval_seconds;
     tokio::spawn(async move {
         loop {
             match sub.recv().await {
@@ -383,7 +459,12 @@ fn spawn_snapshot_to_ch(
                 }
                 Ok(ClusterFrame::Diff(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(lagged = n, symbol = %spec.symbol, "ch fanout lagged behind bus");
+                    tracing::warn!(
+                        lagged = n,
+                        symbol = %spec.symbol,
+                        interval_seconds = interval,
+                        "ch fanout lagged behind bus"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
@@ -501,6 +582,20 @@ mod tests {
         }
     }
 
+    /// Тест-хелпер: построить ch_tx_by_tf по списку timeframes из конфига.
+    /// Возвращает Map + Vec приёмников (чтобы они не дропнулись и каналы
+    /// не закрылись, пока тест работает).
+    fn build_ch_txs(ingest: &IngestConfig) -> (HashMap<u32, mpsc::Sender<ClusterRow>>, Vec<mpsc::Receiver<ClusterRow>>) {
+        let mut txs = HashMap::new();
+        let mut rxs = Vec::new();
+        for &tf in &ingest.timeframes_secs {
+            let (tx, rx) = mpsc::channel(64);
+            txs.insert(tf, tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
+    }
+
     #[tokio::test]
     async fn reconcile_adds_new_and_drops_delisted() {
         let info = Arc::new(MockInfo {
@@ -510,15 +605,16 @@ mod tests {
             ]),
         });
         let bus = Arc::new(ClusterBus::new());
-        let (ch_tx, _ch_rx) = mpsc::channel(64);
+        let ingest = IngestConfig::default();
+        let (ch_txs, _ch_rxs) = build_ch_txs(&ingest);
         let supervisor = BinanceSupervisor::new(
             info.clone(),
             None,
             bus.clone(),
             "test".into(),
-            IngestConfig::default(),
+            ingest,
             cfg(),
-            ch_tx,
+            ch_txs,
         );
 
         // First cycle: 2 symbols, both spawn.
@@ -580,7 +676,8 @@ mod tests {
             .collect(),
         });
         let bus = Arc::new(ClusterBus::new());
-        let (ch_tx, _ch_rx) = mpsc::channel(64);
+        let ingest = IngestConfig::default();
+        let (ch_txs, _ch_rxs) = build_ch_txs(&ingest);
         let mut c = cfg();
         c.rank_by = RankBy::Volume24h;
         c.top_n = Some(2);
@@ -590,9 +687,9 @@ mod tests {
             Some(Arc::clone(&ranker) as Arc<dyn VolumeRanker>),
             bus,
             "test".into(),
-            IngestConfig::default(),
+            ingest,
             c,
-            ch_tx,
+            ch_txs,
         );
         supervisor.reconcile_once().await.unwrap();
 
