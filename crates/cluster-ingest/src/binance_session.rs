@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use exchange_binance::{BinanceFuturesTradeParser, BinanceFuturesWs};
+use exchange_binance::BinanceFuturesTradeParser;
 use exchange_core::{SymbolSpec, TradePrint, WsConnector};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -34,7 +34,7 @@ pub struct SymbolRoute {
 /// If `connect_timeout` elapses before the TLS+WS handshake completes
 /// we give up rather than letting the dial hang indefinitely.
 pub async fn run_session(
-    connector: &BinanceFuturesWs,
+    connector: &dyn WsConnector,
     routes: &[SymbolRoute],
     connect_timeout: Duration,
 ) -> Result<SessionStats> {
@@ -172,6 +172,7 @@ pub struct SessionStats {
 mod tests {
     use std::net::SocketAddr;
 
+    use exchange_binance::BinanceFuturesWs;
     use exchange_core::{Exchange, MarketType, Quote};
     use tokio::net::TcpListener;
 

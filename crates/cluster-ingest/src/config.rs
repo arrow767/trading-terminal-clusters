@@ -162,6 +162,12 @@ impl AuthConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ExchangesConfig {
     pub binance_perp: Option<BinancePerpConfig>,
+    /// Конфиг Binance spot (api.binance.com + stream.binance.com:9443).
+    /// Той же формы, что и `binance_perp`: символьные фильтры, top_n,
+    /// rank_by, discovery_poll и WS-параметры. Default отключён —
+    /// включается явным enabled=true или whitelist'ом enabled_exchanges
+    /// (включающим "binance_spot").
+    pub binance_spot: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.

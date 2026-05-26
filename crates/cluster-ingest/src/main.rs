@@ -6,7 +6,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clickhouse_sink::{ChWriter, ChWriterConfig};
 use cluster_engine::ClusterBus;
-use exchange_binance::BinanceFuturesInfo;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -191,19 +190,26 @@ async fn main() -> Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut supervisor_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    let binance_enabled = ingest.is_exchange_enabled("binance_perp", binance_cfg.enabled);
-    let supervisor_task = if binance_enabled {
+    // ─── Binance USD-M perp ─────────────────────────────────────────────
+    let binance_perp_enabled = ingest.is_exchange_enabled("binance_perp", binance_cfg.enabled);
+    if binance_perp_enabled {
         // One Arc, two trait views: ExchangeInfo for symbol discovery,
         // VolumeRanker for top-N ordering. Sharing the underlying
         // BinanceFuturesInfo keeps the reqwest client (with its
         // connection pool) shared between both endpoints.
-        let raw = Arc::new(BinanceFuturesInfo::new());
+        let raw = Arc::new(exchange_binance::BinanceFuturesInfo::new());
         let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
         let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> =
+            Arc::new(exchange_binance::BinanceFuturesWs::new());
         let supervisor = BinanceSupervisor::new(
             info,
             ranker,
+            connector,
+            exchange_core::Exchange::BinanceF,
+            exchange_core::MarketType::Perp,
             Arc::clone(&bus),
             ingest.region.clone(),
             ingest.clone(),
@@ -211,13 +217,51 @@ async fn main() -> Result<()> {
             ch_tx_by_tf.clone(),
         );
         let shutdown_for_sup = shutdown_rx.clone();
-        Some(tokio::spawn(async move {
+        supervisor_tasks.push(tokio::spawn(async move {
             supervisor.run(shutdown_for_sup).await;
-        }))
+        }));
+        tracing::info!("supervisor started: binance_perp");
     } else {
-        tracing::info!("binance_perp disabled in config; supervisor not started");
-        None
-    };
+        tracing::info!("binance_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── Binance spot ───────────────────────────────────────────────────
+    // Тот же supervisor-движок, что и для perp — отличается только
+    // ExchangeInfo (api.binance.com) + WsConnector (stream.binance.com:9443).
+    // Конфиг секции [ingest.exchanges.binance_spot]: если не задана →
+    // используем дефолты BinancePerpConfig (по умолчанию enabled=true).
+    let binance_spot_cfg = ingest
+        .exchanges
+        .binance_spot
+        .clone()
+        .unwrap_or_default();
+    let binance_spot_enabled = ingest.is_exchange_enabled("binance_spot", binance_spot_cfg.enabled);
+    if binance_spot_enabled {
+        let raw = Arc::new(exchange_binance::BinanceSpotInfo::new());
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> =
+            Arc::new(exchange_binance::BinanceSpotWs::new());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            exchange_core::Exchange::Binance,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            binance_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: binance_spot");
+    } else {
+        tracing::info!("binance_spot not in enabled_exchanges; skipped");
+    }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а
     // (когда его собственные клоны тоже дропнутся) writer'ы увидели close
@@ -232,7 +276,7 @@ async fn main() -> Result<()> {
     tracing::info!("ctrl-c received; signalling shutdown");
 
     let _ = shutdown_tx.send(true);
-    if let Some(t) = supervisor_task {
+    for t in supervisor_tasks {
         let _ = t.await;
     }
     grpc_handle.abort();

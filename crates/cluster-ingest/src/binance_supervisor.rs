@@ -5,10 +5,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clickhouse_sink::{rows_from_snapshot, ClusterRow};
 use cluster_engine::{run_aggregator, Aggregator, ClusterBus};
-use exchange_binance::BinanceFuturesWs;
 use exchange_core::{
     ClusterFrame, Exchange, ExchangeInfo, MarketType, Quote, StreamKey, SymbolKey, SymbolSpec,
-    TradePrint, VolumeRanker,
+    TradePrint, VolumeRanker, WsConnector,
 };
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
@@ -41,6 +40,16 @@ use crate::config::{BinancePerpConfig, IngestConfig, RankBy};
 pub struct BinanceSupervisor {
     info: Arc<dyn ExchangeInfo>,
     ranker: Option<Arc<dyn VolumeRanker>>,
+    /// WS-коннектор. Inject'ится снаружи (BinanceFuturesWs / BinanceSpotWs / ...)
+    /// — иначе supervisor хардкодился бы под futures, и spot/новые биржи
+    /// требовали бы дублирования файла.
+    connector: Arc<dyn WsConnector>,
+    /// Exchange + market_type, под которые этот supervisor фильтрует
+    /// universe. Поле — single-source-of-truth: filter_symbols сверяется
+    /// именно с этой парой, чтобы один supervisor никогда не подхватил
+    /// futures-данные в spot-pipeline (и наоборот).
+    exchange: Exchange,
+    market_type: MarketType,
     bus: Arc<ClusterBus>,
     region: String,
     ingest: IngestConfig,
@@ -69,6 +78,9 @@ impl BinanceSupervisor {
     pub fn new(
         info: Arc<dyn ExchangeInfo>,
         ranker: Option<Arc<dyn VolumeRanker>>,
+        connector: Arc<dyn WsConnector>,
+        exchange: Exchange,
+        market_type: MarketType,
         bus: Arc<ClusterBus>,
         region: String,
         ingest: IngestConfig,
@@ -79,6 +91,9 @@ impl BinanceSupervisor {
         Self {
             info,
             ranker,
+            connector,
+            exchange,
+            market_type,
             bus,
             region,
             ingest,
@@ -91,7 +106,7 @@ impl BinanceSupervisor {
 
     /// Drive discovery + WS session until `shutdown` flips to true.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
-        let connector = BinanceFuturesWs::new();
+        let connector = Arc::clone(&self.connector);
         let routes_rx = self.routes_tx.subscribe();
         let session_shutdown = shutdown.clone();
         let ws_timeout = self.cfg.ws_connect_timeout();
@@ -157,7 +172,7 @@ impl BinanceSupervisor {
             .fetch_symbols()
             .await
             .map_err(|e| anyhow::anyhow!("fetch_symbols: {e}"))?;
-        let filtered = filter_symbols(&specs, &self.cfg);
+        let filtered = filter_symbols(&specs, &self.cfg, self.exchange, self.market_type);
         let ranked = self.rank_specs(filtered).await;
         let wanted: Vec<SymbolSpec> = match self.cfg.top_n {
             Some(n) => ranked.into_iter().take(n).collect(),
@@ -328,7 +343,15 @@ impl BinanceSupervisor {
 
 /// Apply allow/deny/quote filters from config, but DO NOT apply
 /// `top_n` — truncation runs after ranking in `BinanceSupervisor`.
-pub fn filter_symbols(specs: &[SymbolSpec], cfg: &BinancePerpConfig) -> Vec<SymbolSpec> {
+/// `exchange`/`market_type` — пара, под которую supervisor работает; всё
+/// что не из этой пары — отбрасывается (futures-supervisor никогда не
+/// возьмёт spot-листинг и наоборот).
+pub fn filter_symbols(
+    specs: &[SymbolSpec],
+    cfg: &BinancePerpConfig,
+    exchange: Exchange,
+    market_type: MarketType,
+) -> Vec<SymbolSpec> {
     let allow: Option<HashSet<&str>> = if cfg.allow.is_empty() {
         None
     } else {
@@ -348,7 +371,7 @@ pub fn filter_symbols(specs: &[SymbolSpec], cfg: &BinancePerpConfig) -> Vec<Symb
     specs
         .iter()
         .filter(|s| {
-            if s.exchange != Exchange::BinanceF || s.market_type != MarketType::Perp {
+            if s.exchange != exchange || s.market_type != market_type {
                 return false;
             }
             if !quotes.contains(&s.quote) {
@@ -369,7 +392,7 @@ pub fn filter_symbols(specs: &[SymbolSpec], cfg: &BinancePerpConfig) -> Vec<Symb
 }
 
 async fn run_session_loop(
-    connector: BinanceFuturesWs,
+    connector: Arc<dyn WsConnector>,
     mut routes_rx: watch::Receiver<Vec<SymbolRoute>>,
     connect_timeout: Duration,
     backoff_min: Duration,
@@ -392,7 +415,7 @@ async fn run_session_loop(
             continue;
         }
 
-        let session = run_session(&connector, &routes_snapshot, connect_timeout);
+        let session = run_session(connector.as_ref(), &routes_snapshot, connect_timeout);
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
@@ -478,6 +501,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use exchange_binance::BinanceFuturesWs;
     use exchange_core::Quote;
 
     use super::*;
@@ -513,7 +537,7 @@ mod tests {
                 ..spec("BTCUSDT_SPOT", Quote::Usdt)
             },
         ];
-        let kept = filter_symbols(&specs, &cfg());
+        let kept = filter_symbols(&specs, &cfg(), Exchange::BinanceF, MarketType::Perp);
         let symbols: Vec<&str> = kept.iter().map(|s| s.symbol.as_str()).collect();
         assert!(symbols.contains(&"BTCUSDT"));
         assert!(symbols.contains(&"ETHUSDC"));
@@ -529,7 +553,7 @@ mod tests {
         ];
         let mut c = cfg();
         c.allow = vec!["BTCUSDT".into()];
-        let kept = filter_symbols(&specs, &c);
+        let kept = filter_symbols(&specs, &c, Exchange::BinanceF, MarketType::Perp);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol, "BTCUSDT");
     }
@@ -539,7 +563,7 @@ mod tests {
         let specs = vec![spec("BTCUSDT", Quote::Usdt), spec("ETHUSDT", Quote::Usdt)];
         let mut c = cfg();
         c.deny = vec!["BTCUSDT".into()];
-        let kept = filter_symbols(&specs, &c);
+        let kept = filter_symbols(&specs, &c, Exchange::BinanceF, MarketType::Perp);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol, "ETHUSDT");
     }
@@ -553,7 +577,7 @@ mod tests {
             .collect();
         let mut c = cfg();
         c.top_n = Some(3);
-        let kept = filter_symbols(&specs, &c);
+        let kept = filter_symbols(&specs, &c, Exchange::BinanceF, MarketType::Perp);
         assert_eq!(kept.len(), 10);
     }
 
@@ -610,6 +634,9 @@ mod tests {
         let supervisor = BinanceSupervisor::new(
             info.clone(),
             None,
+            Arc::new(BinanceFuturesWs::new()) as Arc<dyn WsConnector>,
+            Exchange::BinanceF,
+            MarketType::Perp,
             bus.clone(),
             "test".into(),
             ingest,
@@ -685,6 +712,9 @@ mod tests {
         let supervisor = BinanceSupervisor::new(
             info,
             Some(Arc::clone(&ranker) as Arc<dyn VolumeRanker>),
+            Arc::new(BinanceFuturesWs::new()) as Arc<dyn WsConnector>,
+            Exchange::BinanceF,
+            MarketType::Perp,
             bus,
             "test".into(),
             ingest,
