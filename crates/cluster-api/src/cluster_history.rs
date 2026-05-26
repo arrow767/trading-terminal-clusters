@@ -33,13 +33,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::timeframes::{is_supported_interval, table_name_for};
 
-/// Защита: грубый верхний предел на размер ответа. 200k buckets ≈
-/// 200k × 8 fields × 8 bytes ≈ 12 MB в памяти, после gzip десятки КБ —
-/// клиент справится. Реальный диапазон под этим:
-///   30s × 1 день ≈ 2880 windows × ~30 buckets = 86k → влезает
-///   1m  × 7 дней ≈ 10080 windows × ~30 buckets = 300k → НЕ влезает,
-///     клиент должен бить на 2–3 чанка (это нормально для lazy-prefetch).
-const MAX_BARS: u64 = 200_000;
+/// Защита: грубый верхний предел на размер ответа.
+///
+/// История параметра:
+///   v1: 200k — это резало нормальные запросы вроде «5m × 7д» (estimate
+///       201_600 → 413). Терминал на estimate'е, не на реальном размере,
+///       и его лимит был just-over.
+///   v2 (текущее): 500k — даёт реалистичный потолок: 5m × 7д estimate
+///       ~200k влезает с запасом; 30s × 24h ~288k влезает; 30m × 30д
+///       ~144k влезает. Реальные ответы обычно В 2-3 РАЗА меньше estimate
+///       (estimate использует BUCKETS_PER_WINDOW=100 worst-case),
+///       так что на сервере мы держим ≤ 500k × 8 fields × 8 bytes ≈
+///       30MB в памяти на запрос, gzip срезает до ~3 МБ wire — ОК.
+const MAX_BARS: u64 = 500_000;
 
 /// Состояние, нужное хендлеру. Шейрится с `SysMetricsState` намеренно —
 /// одно подключение, одни креды на REST. Если в будущем понадобятся
@@ -337,10 +343,12 @@ fn validate_params(q: &RangeParams) -> Result<(), String> {
 /// число price-bucket'ов) сколько строк теоретически можно получить.
 /// Цель — отсечь явно нереалистичные запросы (год 30s по одному symbol).
 ///
-/// Предположение: 100 buckets/window в худшем случае (волатильный
-/// symbol типа BTC). Это с запасом — обычно 10–40.
+/// Предположение: 50 buckets/window средне-волатильного символа.
+/// На очень волатильных BTC может быть 200+, но реальный count'а
+/// проверка происходит уже после CH-фетча (если CH вернул больше —
+/// мы обрезаем по MAX_BARS, см. parse-loop с break при out.n >= MAX_BARS).
 fn estimate_max_rows(q: &RangeParams) -> u64 {
-    const BUCKETS_PER_WINDOW: u64 = 100;
+    const BUCKETS_PER_WINDOW: u64 = 50;
     let span_ms = (q.to_ms - q.from_ms).max(0) as u64;
     let tf_ms = q.interval_seconds as u64 * 1000;
     let windows = span_ms / tf_ms.max(1);
@@ -430,12 +438,18 @@ mod tests {
 
     #[test]
     fn estimate_caps_silly_ranges() {
-        // 30s × 365 дней = 1051200 windows * 100 = 105M строк → отсекаем.
+        // 30s × 365 дней × 50 buckets/win ≈ 52M строк → отсекаем.
         let yr = p(30, 0, 365 * 86_400_000);
         assert!(estimate_max_rows(&yr) > MAX_BARS);
-        // 1m × 1 час = 60 окон * 100 = 6000 → пропускаем.
+        // 1m × 1 час = 60 окон × 50 = 3000 → пропускаем.
         let hr = p(60, 0, 3_600_000);
         assert!(estimate_max_rows(&hr) < MAX_BARS);
+        // Регресс: ранее 5m × 7d давал estimate 201_600 vs cap 200_000
+        // (фейлило с 413). Теперь cap=500k, estimate=50/win →
+        // 7d/5min × 50 = 100_800, спокойно влезает.
+        let five_min_week = p(300, 0, 7 * 86_400_000);
+        assert!(estimate_max_rows(&five_min_week) < MAX_BARS,
+            "5m × 7d must fit: estimate={}", estimate_max_rows(&five_min_week));
     }
 
     #[test]
