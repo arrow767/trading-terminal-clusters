@@ -185,8 +185,23 @@ pub(crate) fn parse_exchange_info(json: &str) -> Result<Vec<SymbolSpec>> {
         }
         let price_scale = count_decimals_trimmed(tick_str);
         let qty_scale = count_decimals_trimmed(step_str);
-        let tick_size = parse_scaled(tick_str, price_scale)?;
-        let step_size = parse_scaled(step_str, qty_scale)?;
+        // Один кривой символ не должен класть весь fetch — `?`-bubble
+        // привёл бы к Err из всей discovery-cycle (видел на YFIUSDT и т.п.
+        // с экзотическими scale'ами). Skip ONLY this symbol, log, continue.
+        let tick_size = match parse_scaled(tick_str, price_scale) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(symbol = %symbol, tick = tick_str, error = %e, "spot skip: bad tickSize");
+                continue;
+            }
+        };
+        let step_size = match parse_scaled(step_str, qty_scale) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(symbol = %symbol, step = step_str, error = %e, "spot skip: bad stepSize");
+                continue;
+            }
+        };
         if tick_size <= 0 || step_size <= 0 {
             tracing::warn!(symbol = %symbol, "spot skip: zero tick/step");
             continue;

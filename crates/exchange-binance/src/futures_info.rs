@@ -174,8 +174,22 @@ pub(crate) fn parse_exchange_info(json: &str) -> Result<Vec<SymbolSpec>> {
         }
         let price_scale = count_decimals_trimmed(tick_str);
         let qty_scale = count_decimals_trimmed(step_str);
-        let tick_size = parse_scaled(tick_str, price_scale)?;
-        let step_size = parse_scaled(step_str, qty_scale)?;
+        // Graceful skip per symbol на ошибке (см. spot_info.rs — та же
+        // защита от падения всего discovery cycle из-за одного экзотика).
+        let tick_size = match parse_scaled(tick_str, price_scale) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(symbol = %symbol, tick = tick_str, error = %e, "futures skip: bad tickSize");
+                continue;
+            }
+        };
+        let step_size = match parse_scaled(step_str, qty_scale) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(symbol = %symbol, step = step_str, error = %e, "futures skip: bad stepSize");
+                continue;
+            }
+        };
         if tick_size <= 0 || step_size <= 0 {
             tracing::warn!(symbol = %symbol, "futures skip: zero tick/step");
             continue;

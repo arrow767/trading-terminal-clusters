@@ -66,7 +66,12 @@ pub(crate) fn parse_scaled(s: &str, scale: u8) -> Result<i64> {
         .parse()
         .map_err(|e: std::num::ParseIntError| ExchangeError::Parse(e.to_string()))?;
 
-    let frac_val: i64 = if frac_part.is_empty() {
+    let frac_val: i64 = if frac_part.is_empty() || scale_usize == 0 {
+        // scale=0: дробная часть отбрасывается целиком (truncate-to-integer).
+        // Без этого ветки происходил `""`.parse::<i64>() → error на любом
+        // вызове с не-нулевым fractional при scale=0 (например parse trade
+        // qty="0.001" со spec'ом qty_scale=0 — типично для крупных монет
+        // где stepSize="1" целочисленный → scale=0).
         0
     } else if frac_part.len() <= scale_usize {
         let mut padded = String::with_capacity(scale_usize);
