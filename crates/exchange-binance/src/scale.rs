@@ -1,5 +1,30 @@
 use exchange_core::{ExchangeError, Result};
 
+/// Считает значимые десятичные знаки в строковом представлении decimal'а:
+/// "0.10000000" → 1; "0.01" → 2; "1" → 0; "0.123" → 3.
+///
+/// КРИТИЧНО для consistency: fat-terminal (TradingTerminal.Engine.Specs.cs)
+/// использует ровно эту формулу для вычисления своего price_scale/qty_scale
+/// от tickSize/stepSize. Если сервер возьмёт `pricePrecision` из exchangeInfo
+/// (которое для BTCUSDT futures = 2, а tickSize = "0.10" → decimals = 1)
+/// — scale разойдётся на 10×, история на чарте будет на y-coord в 10 раз
+/// выше реального. Для spot ещё хуже: `quoteAssetPrecision = 8` всегда,
+/// расхождение до 10^6.
+///
+/// Единственный источник правды — tickSize/stepSize string. Здесь.
+pub(crate) fn count_decimals_trimmed(value: &str) -> u8 {
+    let Some(dot) = value.find('.') else {
+        return 0;
+    };
+    let trimmed = value.trim_end_matches('0');
+    // "1." → 0; "1.0" trimmed → "1." → 0
+    if trimmed.ends_with('.') {
+        return 0;
+    }
+    let after_dot = trimmed.len() - dot - 1;
+    after_dot.min(255) as u8
+}
+
 /// Convert a Binance decimal string like "0.10" to a scaled `i64`,
 /// where the result equals `round(value * 10^scale)`.
 ///
@@ -106,5 +131,20 @@ mod tests {
         assert!(parse_scaled("", 2).is_err());
         assert!(parse_scaled("abc", 2).is_err());
         assert!(parse_scaled("1.2.3", 2).is_err());
+    }
+
+    #[test]
+    fn count_decimals_trimmed_matches_terminal_convention() {
+        // Из EngineServer.Specs.cs:CountDecimalsTrimmed — это конвенция
+        // fat-terminal'а. Должны совпадать байт-в-байт.
+        assert_eq!(count_decimals_trimmed("0.10000000"), 1); // BTCUSDT futures tick
+        assert_eq!(count_decimals_trimmed("0.01000000"), 2); // ETHUSDT spot tick
+        assert_eq!(count_decimals_trimmed("0.10"), 1);
+        assert_eq!(count_decimals_trimmed("0.01"), 2);
+        assert_eq!(count_decimals_trimmed("0.001"), 3);
+        assert_eq!(count_decimals_trimmed("1"), 0);
+        assert_eq!(count_decimals_trimmed("1.0"), 0);
+        assert_eq!(count_decimals_trimmed("100"), 0);
+        assert_eq!(count_decimals_trimmed("0.0001"), 4);
     }
 }

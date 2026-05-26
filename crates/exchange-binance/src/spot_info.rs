@@ -6,7 +6,7 @@ use exchange_core::{
     Exchange, ExchangeError, ExchangeInfo, MarketType, Quote, Result, SymbolSpec, VolumeRanker,
 };
 
-use crate::scale::parse_scaled;
+use crate::scale::{count_decimals_trimmed, parse_scaled};
 
 const DEFAULT_BASE_URL: &str = "https://api.binance.com";
 
@@ -151,43 +151,44 @@ pub(crate) fn parse_exchange_info(json: &str) -> Result<Vec<SymbolSpec>> {
             .ok_or_else(|| ExchangeError::Parse("symbol missing".into()))?
             .to_string();
 
-        // Spot exchangeInfo: `baseAssetPrecision`/`quoteAssetPrecision` —
-        // максимальная precision; реальные шаги в PRICE_FILTER/LOT_SIZE.
-        let price_scale = s
-            .get("quoteAssetPrecision")
-            .or_else(|| s.get("quotePrecision"))
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| ExchangeError::Parse(format!("{symbol}: quote precision missing")))?
-            as u8;
-        let qty_scale = s
-            .get("baseAssetPrecision")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| ExchangeError::Parse(format!("{symbol}: baseAssetPrecision missing")))?
-            as u8;
-
+        // Scale ВЫЧИСЛЯЕМ из tickSize/stepSize, НЕ из baseAssetPrecision/
+        // quoteAssetPrecision. Биржевые поля precision — это про precision
+        // КОШЕЛЬКА (всегда 8 у Binance spot), а реальные шаги торговли
+        // — в PRICE_FILTER/LOT_SIZE. Fat-terminal делает то же самое
+        // (см. count_decimals_trimmed → terminal EngineServer.Specs.cs).
+        // Любое расхождение здесь приведёт к 10^X mismatch'у int64-цен
+        // server vs terminal — история «висит» на чарте на неверной y-координате.
         let filters = s
             .get("filters")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ExchangeError::Parse(format!("{symbol}: filters missing")))?;
-        let mut tick_size: i64 = 0;
-        let mut step_size: i64 = 0;
+        let mut tick_str = "";
+        let mut step_str = "";
         for f in filters {
             match f.get("filterType").and_then(|v| v.as_str()).unwrap_or("") {
                 "PRICE_FILTER" => {
                     if let Some(t) = f.get("tickSize").and_then(|v| v.as_str()) {
-                        tick_size = parse_scaled(t, price_scale)?;
+                        tick_str = t;
                     }
                 }
                 "LOT_SIZE" => {
                     if let Some(t) = f.get("stepSize").and_then(|v| v.as_str()) {
-                        step_size = parse_scaled(t, qty_scale)?;
+                        step_str = t;
                     }
                 }
                 _ => {}
             }
         }
-        if tick_size <= 0 || step_size <= 0 {
+        if tick_str.is_empty() || step_str.is_empty() {
             tracing::warn!(symbol = %symbol, "spot skip: missing PRICE_FILTER or LOT_SIZE");
+            continue;
+        }
+        let price_scale = count_decimals_trimmed(tick_str);
+        let qty_scale = count_decimals_trimmed(step_str);
+        let tick_size = parse_scaled(tick_str, price_scale)?;
+        let step_size = parse_scaled(step_str, qty_scale)?;
+        if tick_size <= 0 || step_size <= 0 {
+            tracing::warn!(symbol = %symbol, "spot skip: zero tick/step");
             continue;
         }
 
@@ -279,11 +280,17 @@ mod tests {
         assert_eq!(btc.exchange, Exchange::Binance);
         assert_eq!(btc.market_type, MarketType::Spot);
         assert_eq!(btc.quote, Quote::Usdt);
-        assert_eq!(btc.tick_size, 1_000_000); // 0.01 × 10^8
-        assert_eq!(btc.step_size, 1_000);       // 0.00001 × 10^8
+        // tickSize "0.01000000" trim → "0.01" → 2 decimals → scale=100.
+        // step "0.00001000" trim → "0.00001" → 5 decimals → scale=100000.
+        assert_eq!(btc.price_scale, 2);
+        assert_eq!(btc.qty_scale, 5);
+        assert_eq!(btc.tick_size, 1);   // 0.01 × 100 = 1
+        assert_eq!(btc.step_size, 1);   // 0.00001 × 100000 = 1
 
         let eth = specs.iter().find(|s| s.symbol == "ETHUSDC").unwrap();
         assert_eq!(eth.quote, Quote::Usdc);
+        assert_eq!(eth.price_scale, 2); // tick="0.01"
+        assert_eq!(eth.qty_scale, 4);   // step="0.0001" (per fixture)
     }
 
     #[test]

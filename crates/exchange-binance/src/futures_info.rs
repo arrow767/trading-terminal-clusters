@@ -6,7 +6,7 @@ use exchange_core::{
     Exchange, ExchangeError, ExchangeInfo, MarketType, Quote, Result, SymbolSpec, VolumeRanker,
 };
 
-use crate::scale::parse_scaled;
+use crate::scale::{count_decimals_trimmed, parse_scaled};
 
 const DEFAULT_BASE_URL: &str = "https://fapi.binance.com";
 
@@ -141,40 +141,43 @@ pub(crate) fn parse_exchange_info(json: &str) -> Result<Vec<SymbolSpec>> {
             .ok_or_else(|| ExchangeError::Parse("symbol missing".into()))?
             .to_string();
 
-        let price_scale = s
-            .get("pricePrecision")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| ExchangeError::Parse(format!("{symbol}: pricePrecision missing")))?
-            as u8;
-        let qty_scale = s
-            .get("quantityPrecision")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| ExchangeError::Parse(format!("{symbol}: quantityPrecision missing")))?
-            as u8;
-
+        // Scale = decimals в tickSize/stepSize (НЕ pricePrecision/
+        // quantityPrecision из exchangeInfo). Терминальный код
+        // (EngineServer.Specs.cs:CountDecimalsTrimmed) использует ровно
+        // эту формулу. Для BTCUSDT futures: pricePrecision = 2, tickSize =
+        // "0.10" → decimals = 1. Раньше сервер использовал pricePrecision
+        // → 10× mismatch на price y-axis.
         let filters = s
             .get("filters")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ExchangeError::Parse(format!("{symbol}: filters missing")))?;
-        let mut tick_size: i64 = 0;
-        let mut step_size: i64 = 0;
+        let mut tick_str = "";
+        let mut step_str = "";
         for f in filters {
             match f.get("filterType").and_then(|v| v.as_str()).unwrap_or("") {
                 "PRICE_FILTER" => {
                     if let Some(t) = f.get("tickSize").and_then(|v| v.as_str()) {
-                        tick_size = parse_scaled(t, price_scale)?;
+                        tick_str = t;
                     }
                 }
                 "LOT_SIZE" => {
                     if let Some(t) = f.get("stepSize").and_then(|v| v.as_str()) {
-                        step_size = parse_scaled(t, qty_scale)?;
+                        step_str = t;
                     }
                 }
                 _ => {}
             }
         }
+        if tick_str.is_empty() || step_str.is_empty() {
+            tracing::warn!(symbol = %symbol, "futures skip: missing PRICE_FILTER or LOT_SIZE");
+            continue;
+        }
+        let price_scale = count_decimals_trimmed(tick_str);
+        let qty_scale = count_decimals_trimmed(step_str);
+        let tick_size = parse_scaled(tick_str, price_scale)?;
+        let step_size = parse_scaled(step_str, qty_scale)?;
         if tick_size <= 0 || step_size <= 0 {
-            tracing::warn!(symbol = %symbol, "skipping: missing PRICE_FILTER or LOT_SIZE");
+            tracing::warn!(symbol = %symbol, "futures skip: zero tick/step");
             continue;
         }
 
@@ -265,14 +268,17 @@ mod tests {
         assert_eq!(btc.exchange, Exchange::BinanceF);
         assert_eq!(btc.market_type, MarketType::Perp);
         assert_eq!(btc.quote, Quote::Usdt);
-        assert_eq!(btc.price_scale, 2);
+        // Scale = decimals_trimmed(tickSize/stepSize). Для BTCUSDT
+        // futures tickSize="0.10" → 1 decimal → scale=10; step "0.001" → 3.
+        assert_eq!(btc.price_scale, 1);
         assert_eq!(btc.qty_scale, 3);
-        assert_eq!(btc.tick_size, 10); // 0.10 * 100
-        assert_eq!(btc.step_size, 1); // 0.001 * 1000
+        assert_eq!(btc.tick_size, 1);  // 0.10 × 10 = 1
+        assert_eq!(btc.step_size, 1);  // 0.001 × 1000 = 1
 
         let eth = specs.iter().find(|s| s.symbol == "ETHUSDC").unwrap();
         assert_eq!(eth.quote, Quote::Usdc);
-        assert_eq!(eth.tick_size, 1); // 0.01 * 100
+        assert_eq!(eth.price_scale, 2); // tick="0.01" → 2 decimals
+        assert_eq!(eth.tick_size, 1);   // 0.01 × 100 = 1
     }
 
     #[test]
