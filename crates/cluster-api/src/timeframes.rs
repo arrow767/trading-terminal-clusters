@@ -11,7 +11,7 @@
 
 /// Список TF, для которых есть готовые таблицы в миграции 003.
 /// Запросы на другие значения должны быть отклонены validate_interval.
-pub const SUPPORTED_INTERVALS: &[u32] = &[30, 60, 300, 900, 3600, 14400, 86400];
+pub const SUPPORTED_INTERVALS: &[u32] = &[30, 60, 300, 900, 1800, 3600, 14400, 86400];
 
 /// Имя таблицы CH для interval_seconds. Convention: `clusters_<human>`,
 /// где `<human>` = 30s / 1m / 5m / 15m / 1h / 4h / 1d для стандартных
@@ -24,6 +24,7 @@ pub fn table_name_for(interval_seconds: u32) -> String {
         60 => "1m".to_string(),
         300 => "5m".to_string(),
         900 => "15m".to_string(),
+        1800 => "30m".to_string(),
         3600 => "1h".to_string(),
         14400 => "4h".to_string(),
         86400 => "1d".to_string(),
@@ -50,6 +51,7 @@ mod tests {
         assert_eq!(table_name_for(60), "clusters_1m");
         assert_eq!(table_name_for(300), "clusters_5m");
         assert_eq!(table_name_for(900), "clusters_15m");
+        assert_eq!(table_name_for(1800), "clusters_30m");
         assert_eq!(table_name_for(3600), "clusters_1h");
         assert_eq!(table_name_for(14400), "clusters_4h");
         assert_eq!(table_name_for(86400), "clusters_1d");
