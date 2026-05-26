@@ -168,6 +168,13 @@ pub struct ExchangesConfig {
     /// включается явным enabled=true или whitelist'ом enabled_exchanges
     /// (включающим "binance_spot").
     pub binance_spot: Option<BinancePerpConfig>,
+    /// Bybit V5 USDT/USDC linear perps (api.bybit.com /v5/linear).
+    /// Поддерживает BTCUSDT (USDT-linear) и BTCPERP (USDC-linear).
+    /// Config — общая форма BinancePerpConfig: filter symbols, top_n,
+    /// rank_by, ws-параметры.
+    pub bybit_perp: Option<BinancePerpConfig>,
+    /// Bybit V5 spot (api.bybit.com /v5/spot, ws .../public/spot).
+    pub bybit_spot: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.

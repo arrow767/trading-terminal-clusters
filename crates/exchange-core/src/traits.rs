@@ -45,7 +45,7 @@ pub enum PingKind {
     ServerInitiated,
 }
 
-pub trait WsConnector: Send + Sync {
+pub trait WsConnector: Send + Sync + std::any::Any {
     fn ws_url(&self) -> &str;
 
     fn subscribe_payload(&self, symbols: &[&SymbolSpec]) -> String;
@@ -57,6 +57,16 @@ pub trait WsConnector: Send + Sync {
     fn pong_timeout_ms(&self) -> u64;
 
     fn max_subscriptions_per_socket(&self) -> usize;
+
+    /// Downcast escape-hatch. Нужен для exchange-specific session-
+    /// runner'ов, которые принимают конкретный тип connector'а (например
+    /// `&BybitWs` для `bybit_session::run_session` — там есть методы
+    /// `subscribe_payloads_batched`, отсутствующие в общем trait'е).
+    /// Trait-объекты не могут вызвать inherent-методы реализации без
+    /// downcast, и без `Self: Sized` ограничения в default impl метод
+    /// был бы недоступен через `&dyn WsConnector`. Поэтому делаем
+    /// обязательной: каждый impl возвращает `self`.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub trait TradeParser: Send + Sync {

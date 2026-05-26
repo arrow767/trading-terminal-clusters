@@ -11,9 +11,10 @@ use tokio::task::JoinHandle;
 
 mod binance_session;
 mod binance_supervisor;
+mod bybit_session;
 mod config;
 
-use binance_supervisor::BinanceSupervisor;
+use binance_supervisor::{BinanceSupervisor, SessionFlavor};
 use config::{table_name_for, Config};
 
 #[tokio::main]
@@ -208,6 +209,7 @@ async fn main() -> Result<()> {
             info,
             ranker,
             connector,
+            SessionFlavor::Binance,
             exchange_core::Exchange::BinanceF,
             exchange_core::MarketType::Perp,
             Arc::clone(&bus),
@@ -246,6 +248,7 @@ async fn main() -> Result<()> {
             info,
             ranker,
             connector,
+            SessionFlavor::Binance,
             exchange_core::Exchange::Binance,
             exchange_core::MarketType::Spot,
             Arc::clone(&bus),
@@ -261,6 +264,78 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: binance_spot");
     } else {
         tracing::info!("binance_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── Bybit linear (USDT/USDC perps) ─────────────────────────────────
+    // BTCUSDT (USDT-linear) + BTCPERP (USDC-linear) — оба покрываются
+    // одним endpoint'ом /v5/public/linear и одним instruments-info запросом.
+    let bybit_perp_cfg = ingest
+        .exchanges
+        .bybit_perp
+        .clone()
+        .unwrap_or_default();
+    if ingest.is_exchange_enabled("bybit_perp", bybit_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_bybit::BybitInstrumentsInfo::new(
+            exchange_bybit::BybitCategory::Linear,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_bybit::BybitWs::linear());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Bybit,
+            exchange_core::Exchange::BybitF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            bybit_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: bybit_perp");
+    } else {
+        tracing::info!("bybit_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── Bybit spot ─────────────────────────────────────────────────────
+    let bybit_spot_cfg = ingest
+        .exchanges
+        .bybit_spot
+        .clone()
+        .unwrap_or_default();
+    if ingest.is_exchange_enabled("bybit_spot", bybit_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_bybit::BybitInstrumentsInfo::new(
+            exchange_bybit::BybitCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_bybit::BybitWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Bybit,
+            exchange_core::Exchange::Bybit,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            bybit_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: bybit_spot");
+    } else {
+        tracing::info!("bybit_spot not in enabled_exchanges; skipped");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а

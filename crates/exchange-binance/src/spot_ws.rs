@@ -74,6 +74,10 @@ impl WsConnector for BinanceSpotWs {
     fn max_subscriptions_per_socket(&self) -> usize {
         200
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

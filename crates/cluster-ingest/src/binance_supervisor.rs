@@ -12,8 +12,25 @@ use exchange_core::{
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::binance_session::{run_session, SymbolRoute};
+use crate::binance_session::{run_session as run_binance_session, SymbolRoute};
+use crate::bybit_session::run_session as run_bybit_session;
 use crate::config::{BinancePerpConfig, IngestConfig, RankBy};
+
+/// Какой session-runner использовать для данного supervisor'а.
+///
+/// Каждый exchange-протокол отличается по подписке/heartbeat'у/envelope'у
+/// трейдов (см. screener_exchange_quirks). Один общий `run_session` через
+/// трейт-объект сделать в Rust трудно из-за async-fn-in-trait + специфики
+/// payload-форматов, поэтому диспатчим через простой enum здесь.
+///
+/// При добавлении новой биржи: добавь вариант + новый `xxx_session.rs`
+/// модуль с `pub async fn run_session(connector: &XxxWs, routes, timeout)`,
+/// и match-arm в `run_session_loop`.
+#[derive(Clone, Copy)]
+pub enum SessionFlavor {
+    Binance,
+    Bybit,
+}
 
 /// One supervisor owns the entire pipeline for a single exchange:
 /// REST `ExchangeInfo` polling, the WS session, the per-symbol
@@ -40,10 +57,15 @@ use crate::config::{BinancePerpConfig, IngestConfig, RankBy};
 pub struct BinanceSupervisor {
     info: Arc<dyn ExchangeInfo>,
     ranker: Option<Arc<dyn VolumeRanker>>,
-    /// WS-коннектор. Inject'ится снаружи (BinanceFuturesWs / BinanceSpotWs / ...)
-    /// — иначе supervisor хардкодился бы под futures, и spot/новые биржи
-    /// требовали бы дублирования файла.
+    /// WS-коннектор. Inject'ится снаружи (BinanceFuturesWs / BinanceSpotWs /
+    /// BybitWs / ...) — иначе supervisor хардкодился бы под futures, и
+    /// spot/новые биржи требовали бы дублирования файла.
     connector: Arc<dyn WsConnector>,
+    /// Какую `*_session::run_session` функцию использовать. Per-exchange
+    /// payload-форматы достаточно расходятся (Bybit batched + client-ping
+    /// vs Binance single-trade + server-ping), чтобы делать общий runner
+    /// сейчас — не стоит. Enum-dispatch достаточно.
+    session_flavor: SessionFlavor,
     /// Exchange + market_type, под которые этот supervisor фильтрует
     /// universe. Поле — single-source-of-truth: filter_symbols сверяется
     /// именно с этой парой, чтобы один supervisor никогда не подхватил
@@ -79,6 +101,7 @@ impl BinanceSupervisor {
         info: Arc<dyn ExchangeInfo>,
         ranker: Option<Arc<dyn VolumeRanker>>,
         connector: Arc<dyn WsConnector>,
+        session_flavor: SessionFlavor,
         exchange: Exchange,
         market_type: MarketType,
         bus: Arc<ClusterBus>,
@@ -92,6 +115,7 @@ impl BinanceSupervisor {
             info,
             ranker,
             connector,
+            session_flavor,
             exchange,
             market_type,
             bus,
@@ -112,9 +136,11 @@ impl BinanceSupervisor {
         let ws_timeout = self.cfg.ws_connect_timeout();
         let backoff_min = self.cfg.backoff_min();
         let backoff_max = self.cfg.backoff_max();
+        let flavor = self.session_flavor;
         let session = tokio::spawn(async move {
             run_session_loop(
                 connector,
+                flavor,
                 routes_rx,
                 ws_timeout,
                 backoff_min,
@@ -393,6 +419,7 @@ pub fn filter_symbols(
 
 async fn run_session_loop(
     connector: Arc<dyn WsConnector>,
+    flavor: SessionFlavor,
     mut routes_rx: watch::Receiver<Vec<SymbolRoute>>,
     connect_timeout: Duration,
     backoff_min: Duration,
@@ -415,7 +442,32 @@ async fn run_session_loop(
             continue;
         }
 
-        let session = run_session(connector.as_ref(), &routes_snapshot, connect_timeout);
+        // Per-exchange session entry. Trade-envelope, ping policy и
+        // subscribe-batching различаются между биржами — общим runner'ом
+        // делать без потери прозрачности уже не получается. См.
+        // `SessionFlavor` для гайда по добавлению новой биржи.
+        let session: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::binance_session::SessionStats>> + Send>> =
+            match flavor {
+                SessionFlavor::Binance => Box::pin(run_binance_session(
+                    connector.as_ref(),
+                    &routes_snapshot,
+                    connect_timeout,
+                )),
+                SessionFlavor::Bybit => {
+                    // Bybit connector обязан быть BybitWs — этот инвариант
+                    // следит SessionFlavor в `new()`. Downcast через Any не
+                    // нужен: BybitWs реализует WsConnector, а run_bybit_session
+                    // принимает &BybitWs — так что мы downcast'им через as_any.
+                    // Чтобы не тащить Any в trait WsConnector, идём проще:
+                    // полагаемся на корректность вызова из main.rs
+                    // (тип flavor=Bybit ⇒ connector=BybitWs).
+                    let ws = connector
+                        .as_any()
+                        .downcast_ref::<exchange_bybit::BybitWs>()
+                        .expect("SessionFlavor::Bybit requires BybitWs connector");
+                    Box::pin(run_bybit_session(ws, &routes_snapshot, connect_timeout))
+                }
+            };
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
@@ -635,6 +687,7 @@ mod tests {
             info.clone(),
             None,
             Arc::new(BinanceFuturesWs::new()) as Arc<dyn WsConnector>,
+            SessionFlavor::Binance,
             Exchange::BinanceF,
             MarketType::Perp,
             bus.clone(),
@@ -713,6 +766,7 @@ mod tests {
             info,
             Some(Arc::clone(&ranker) as Arc<dyn VolumeRanker>),
             Arc::new(BinanceFuturesWs::new()) as Arc<dyn WsConnector>,
+            SessionFlavor::Binance,
             Exchange::BinanceF,
             MarketType::Perp,
             bus,

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 exchange-core = { path = "../exchange-core" }
 exchange-binance = { path = "../exchange-binance" }
+exchange-bybit = { path = "../exchange-bybit" }
 cluster-engine = { path = "../cluster-engine" }
 cluster-api = { path = "../cluster-api" }
 wal = { path = "../wal" }

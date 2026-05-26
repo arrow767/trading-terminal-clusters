@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/exchange-core",
     "crates/exchange-binance",
+    "crates/exchange-bybit",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",
