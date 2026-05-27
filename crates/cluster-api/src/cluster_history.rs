@@ -99,6 +99,17 @@ pub struct RangeResponse {
     pub bid_qty: Vec<i64>,
     pub ask_qty: Vec<i64>,
     pub trades: Vec<u32>,
+    /// OHLC окна — **per-window**, не per-bucket. Эти 5 массивов длины
+    /// `windows_n` (НЕ `n`). Клиент группирует buckets по window_start_ms
+    /// и берёт OHLC из i-го элемента по индексу совпадающего window_start
+    /// в `windows`. Сохранение — column-major: меньше байт wire'а (5 × 8 ×
+    /// windows_n вместо 5 × 8 × n, где обычно n ≈ 30-50 × windows_n).
+    pub windows_n: usize,
+    pub windows: Vec<i64>,
+    pub open: Vec<i64>,
+    pub close: Vec<i64>,
+    pub high: Vec<i64>,
+    pub low: Vec<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,12 +155,24 @@ pub async fn cluster_range(
     // Альтернатива (параметрические запросы) добавит сложности без выгоды:
     // символы/market — простые ASCII (валидированы выше), кавычки
     // экранируем для защиты от чёрта-в-имени.
+    //
+    // OHLC доступны на каждой строке (одинаковые для всех bucket'ов окна
+    // — sink повторяет), мы их забираем как `any(open) OVER (PARTITION BY
+    // window_start)` через window-функцию, чтобы при сортировке остался
+    // ровно один OHLC на window. Можно было бы и просто `open` — но если
+    // в CH окажется bucket с другим OHLC (теоретически невозможно при
+    // правильной ingest-логике, но defensive), `any()` выбирает любое
+    // значение детерминированно.
     let sql = format!(
         "SELECT \
            toUnixTimestamp64Milli(window_start) AS ts_ms, \
            price, bid_qty, ask_qty, trades, \
            any(price_scale) OVER () AS ps, \
-           any(qty_scale) OVER () AS qs \
+           any(qty_scale) OVER () AS qs, \
+           any(open) OVER (PARTITION BY window_start) AS o, \
+           any(close) OVER (PARTITION BY window_start) AS c, \
+           any(high) OVER (PARTITION BY window_start) AS h, \
+           any(low) OVER (PARTITION BY window_start) AS l \
          FROM {db}.{table} FINAL \
          WHERE exchange = '{ex}' AND market_type = '{mt}' AND symbol = '{sym}' \
            AND window_start >= fromUnixTimestamp64Milli({from}) \
@@ -207,9 +230,13 @@ pub async fn cluster_range(
             .into_response();
     }
 
-    // JSONCompactEachRow: одна строка per row, формат `[ts_ms, price, bid_qty, ask_qty, trades, ps, qs]`
-    // Парсим в columnar заранее с pre-allocated векторами — снижает
-    // фрагментацию аллокатора при больших ответах.
+    // JSONCompactEachRow: одна строка per row, формат
+    //   [ts_ms, price, bid_qty, ask_qty, trades, ps, qs, open, close, high, low]
+    // Парсим:
+    //   - bucket-data: per-row → arrays длины `n`
+    //   - per-window OHLC: накопим в SEPARATE arrays длины `windows_n`,
+    //     срабатывая на смену ts_ms (входные строки отсортированы по
+    //     ts_ms ASC → последовательная группировка без HashMap).
     let mut out = RangeResponse {
         interval_seconds: q.interval_seconds,
         symbol: q.symbol.clone(),
@@ -223,6 +250,12 @@ pub async fn cluster_range(
         bid_qty: Vec::new(),
         ask_qty: Vec::new(),
         trades: Vec::new(),
+        windows_n: 0,
+        windows: Vec::new(),
+        open: Vec::new(),
+        close: Vec::new(),
+        high: Vec::new(),
+        low: Vec::new(),
     };
     let est = est_rows.min(MAX_BARS) as usize;
     out.window_start_ms.reserve(est);
@@ -230,7 +263,16 @@ pub async fn cluster_range(
     out.bid_qty.reserve(est);
     out.ask_qty.reserve(est);
     out.trades.reserve(est);
+    // Каждое окно содержит ~30-50 buckets — `windows_n ≈ n / 40`. Reserve
+    // более-менее реалистичную верхнюю границу.
+    let est_windows = (est / 20).max(64);
+    out.windows.reserve(est_windows);
+    out.open.reserve(est_windows);
+    out.close.reserve(est_windows);
+    out.high.reserve(est_windows);
+    out.low.reserve(est_windows);
 
+    let mut last_ts: Option<i64> = None;
     for line in body.lines() {
         if line.is_empty() {
             continue;
@@ -264,6 +306,26 @@ pub async fn cluster_range(
                 out.qty_scale = qs.min(u8::MAX as u32) as u8;
             }
         }
+        // OHLC: фиксируем при смене window_start. arr может иметь 7 элементов
+        // (старые legacy записи без OHLC) или 11 (новые). Если 11 — читаем
+        // open/close/high/low; если 7 — пишем 0 (UI трактует как "no body").
+        if last_ts != Some(ts) {
+            last_ts = Some(ts);
+            out.windows.push(ts);
+            if arr.len() >= 11 {
+                out.open.push(json_i64(&arr[7]).unwrap_or(0));
+                out.close.push(json_i64(&arr[8]).unwrap_or(0));
+                out.high.push(json_i64(&arr[9]).unwrap_or(0));
+                out.low.push(json_i64(&arr[10]).unwrap_or(0));
+            } else {
+                out.open.push(0);
+                out.close.push(0);
+                out.high.push(0);
+                out.low.push(0);
+            }
+            out.windows_n += 1;
+        }
+
         out.window_start_ms.push(ts);
         out.price.push(price);
         out.bid_qty.push(bid);

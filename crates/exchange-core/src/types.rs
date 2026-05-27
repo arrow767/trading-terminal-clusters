@@ -149,11 +149,28 @@ impl StreamKey {
 
 /// Full state of the current (still-open) time window for one instrument.
 /// Wire-equivalent of fat-terminal's `AnalyticsSnapshot` (union id 104).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `open/close/high/low` — OHLC цены window'а в scaled int64 (так же
+/// как `ClusterBucket.price`). Используется UI для отрисовки candle body
+/// поверх footprint heatmap. 0 = «не было трейдов в окне» (теоретически
+/// возможно на тонко-торгуемой паре; UI должен skipать candle body).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyticsSnapshot {
     pub window_start_ns: i64,
     pub sequence: i64,
     pub clusters: Vec<ClusterBucket>,
+    /// Цена первого трейда в этом окне (scaled).
+    #[serde(default)]
+    pub open: i64,
+    /// Цена последнего трейда (scaled).
+    #[serde(default)]
+    pub close: i64,
+    /// Максимальная цена трейда (scaled).
+    #[serde(default)]
+    pub high: i64,
+    /// Минимальная цена трейда (scaled).
+    #[serde(default)]
+    pub low: i64,
 }
 
 /// Incremental update since the last snapshot/diff for the same window.

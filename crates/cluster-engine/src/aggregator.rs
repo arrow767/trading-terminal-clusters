@@ -38,6 +38,16 @@ pub struct Aggregator {
     dirty: HashSet<i64>,
     last_diff_emit_ns: i64,
     dropped_late_trades: u64,
+
+    // OHLC текущего window'а — scaled цены трейдов в порядке поступления.
+    // `open` фиксируется на первом трейде окна, `close` обновляется на каждом,
+    // `high/low` — min/max. На window-roll OHLC попадает в closing snapshot
+    // и затем сбрасывается под новое окно. Значения = 0 пока не было трейдов
+    // (различимо от валидных цен — биржевые scaled-prices > 0).
+    open: i64,
+    close: i64,
+    high: i64,
+    low: i64,
 }
 
 impl Aggregator {
@@ -56,6 +66,10 @@ impl Aggregator {
             dirty: HashSet::new(),
             last_diff_emit_ns: 0,
             dropped_late_trades: 0,
+            open: 0,
+            close: 0,
+            high: 0,
+            low: 0,
         }
     }
 
@@ -82,6 +96,12 @@ impl Aggregator {
                 self.dirty.clear();
                 self.sequence = 0;
                 self.last_diff_emit_ns = 0;
+                // OHLC под новый bar — `open` зарегистрируется на первом
+                // трейде нового окна (ниже).
+                self.open = 0;
+                self.close = 0;
+                self.high = 0;
+                self.low = 0;
             }
             Some(curr) if trade_window < curr => {
                 self.dropped_late_trades += 1;
@@ -98,6 +118,25 @@ impl Aggregator {
         }
         acc.trades = acc.trades.saturating_add(1);
         self.dirty.insert(bucket_price);
+
+        // OHLC: open фиксируется единожды на первом трейде окна,
+        // close переписывается на каждом, high/low — running min/max.
+        // Используется raw trade.price (НЕ bucket_price), чтобы OHLC был
+        // точнее тикового шага агрегации (например, при bucket_step=10
+        // мы хотим знать что high был 12347, а не 12340).
+        if self.open == 0 {
+            self.open = trade.price;
+            self.high = trade.price;
+            self.low = trade.price;
+        } else {
+            if trade.price > self.high {
+                self.high = trade.price;
+            }
+            if trade.price < self.low {
+                self.low = trade.price;
+            }
+        }
+        self.close = trade.price;
 
         closing
     }
@@ -148,6 +187,10 @@ impl Aggregator {
         self.current_window_start_ns = None;
         self.sequence = 0;
         self.last_diff_emit_ns = 0;
+        self.open = 0;
+        self.close = 0;
+        self.high = 0;
+        self.low = 0;
         Some(frame)
     }
 
@@ -167,6 +210,10 @@ impl Aggregator {
             window_start_ns: self.current_window_start_ns.unwrap_or(0),
             sequence: self.sequence,
             clusters,
+            open: self.open,
+            close: self.close,
+            high: self.high,
+            low: self.low,
         }))
     }
 }

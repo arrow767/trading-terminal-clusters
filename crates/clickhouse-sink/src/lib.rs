@@ -38,6 +38,16 @@ pub struct ClusterRow {
     pub trades: u32,
     pub qty_scale: u8,
     pub ingest_region: String,
+    /// OHLC окна (scaled i64). Повторяется для всех buckets одного
+    /// window'а — на write-стороне дешево, ColumnsLowCardinality в CH
+    /// хорошо жмёт повторяющиеся значения. Per-window query на read-стороне
+    /// делается через `any(open) GROUP BY window_start`. Если миграция
+    /// прошла на старой таблице — для legacy строк эти поля = 0
+    /// (рендер UI трактует open=close=0 как «нет candle body»).
+    pub open: i64,
+    pub close: i64,
+    pub high: i64,
+    pub low: i64,
 }
 
 pub fn rows_from_snapshot(
@@ -69,6 +79,11 @@ pub fn rows_from_snapshot(
             trades: b.trades,
             qty_scale: spec.qty_scale,
             ingest_region: region.to_string(),
+            // OHLC окна — одинаков для всех buckets этого snapshot'а.
+            open: snap.open,
+            close: snap.close,
+            high: snap.high,
+            low: snap.low,
         })
         .collect()
 }
@@ -294,6 +309,7 @@ mod tests {
             window_start_ns,
             sequence: 1,
             clusters: buckets,
+            ..Default::default()
         }
     }
 

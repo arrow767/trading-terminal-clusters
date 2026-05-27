@@ -247,6 +247,7 @@ mod tests {
                 ask_qty: 50,
                 trades: 12,
             }],
+            ..Default::default()
         }))
     }
 
