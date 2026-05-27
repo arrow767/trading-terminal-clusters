@@ -36,6 +36,19 @@ pub struct Aggregator {
     sequence: i64,
     accum: HashMap<i64, ClusterAccum>,
     dirty: HashSet<i64>,
+    /// Bookkeeping для partial-snapshot delta-emit'а. Отдельный set от
+    /// `dirty` (которое использует `tick()` для гRPC live-diff stream'а
+    /// и очищается своим темпом). `partial_dirty` сбрасывается на каждом
+    /// `current_window_delta()` и на window-roll. ingest() добавляет в
+    /// оба — так оба независимо отслеживают «изменилось ли с моего
+    /// последнего emit'а».
+    ///
+    /// Зачем delta вместо full snapshot: full snap каждой секунды × все
+    /// окна × все TF × все символы = огромный write amplification в CH,
+    /// что вызывает backpressure → bus Lag → потеря фреймов. Delta пишет
+    /// только реально изменённые бакеты с прошлого partial-emit — нагрузка
+    /// масштабируется реальной активностью трейдов, а не cadence'ом.
+    partial_dirty: HashSet<i64>,
     last_diff_emit_ns: i64,
     dropped_late_trades: u64,
 
@@ -64,6 +77,7 @@ impl Aggregator {
             sequence: 0,
             accum: HashMap::new(),
             dirty: HashSet::new(),
+            partial_dirty: HashSet::new(),
             last_diff_emit_ns: 0,
             dropped_late_trades: 0,
             open: 0,
@@ -94,6 +108,7 @@ impl Aggregator {
                 self.current_window_start_ns = Some(trade_window);
                 self.accum.clear();
                 self.dirty.clear();
+                self.partial_dirty.clear();
                 self.sequence = 0;
                 self.last_diff_emit_ns = 0;
                 // OHLC под новый bar — `open` зарегистрируется на первом
@@ -118,6 +133,7 @@ impl Aggregator {
         }
         acc.trades = acc.trades.saturating_add(1);
         self.dirty.insert(bucket_price);
+        self.partial_dirty.insert(bucket_price);
 
         // OHLC: open фиксируется единожды на первом трейде окна,
         // close переписывается на каждом, high/low — running min/max.
@@ -175,27 +191,60 @@ impl Aggregator {
         })))
     }
 
-    /// Emit a snapshot of the **current (still-open) window** without
-    /// mutating accum/OHLC/window state. Used by the runtime's periodic
-    /// partial-snapshot ticker so that clients fetching `/v1/clusters/range`
-    /// see in-progress bar data (which would otherwise live only in this
-    /// aggregator's RAM until window roll).
+    /// Emit a **delta snapshot** of the current (still-open) window: only
+    /// buckets touched since the previous `current_window_delta()` call,
+    /// each with its full accumulated state at this moment + current OHLC.
+    /// Used by the runtime's periodic partial-snapshot ticker so that CH
+    /// и REST `/v1/clusters/range` отдают in-progress bar данные, при этом
+    /// нагрузка на CH масштабируется реальной активностью трейдов, а не
+    /// фиксированной cadence × все цены.
+    ///
+    /// **Корректность при делта-эмите**: каждая запись бакета имеет
+    /// `ingested_at` от CH (DEFAULT now64()). ReplacingMergeTree FINAL
+    /// возвращает строку с max(ingested_at) per (exchange, market_type,
+    /// symbol, window_start, price). Так как `accum` для бакета только
+    /// монотонно растёт (qty аккумулируются), каждый последующий эмит
+    /// дельты содержит "более полное" значение — последняя запись всегда
+    /// корректна. Если делта-эмит потерян (network/CH-throttle), следующий
+    /// делта или закрывающий snapshot восстанавливает корректное состояние:
+    /// `tick()`-Diff и `build_closing_snapshot()` пишут ВСЕ бакеты в `accum`,
+    /// а closing-snapshot гарантированно пишется при window-roll, перезаписывая
+    /// все потерянные дельты последним полным состоянием окна.
     ///
     /// Bumps `sequence` — partial-snapshot is a regular monotonic frame
     /// on the bus, indistinguishable to subscribers from the closing one
     /// except that more frames for the same `window_start_ns` may follow.
-    /// On the CH side, `ReplacingMergeTree(ingested_at)` dedupes per
-    /// `(exchange, market_type, symbol, window_start, price)` PK so each
-    /// new write overwrites the previous (latest `ingested_at` wins on
-    /// FINAL).
     ///
-    /// Returns None if the window has no trades yet — emitting an empty
-    /// snapshot is pointless and would just waste a bus slot.
-    pub fn current_window_snapshot(&mut self) -> Option<ClusterFrame> {
-        if self.accum.is_empty() || self.current_window_start_ns.is_none() {
+    /// Returns None if no buckets were touched since the previous emit
+    /// (window is dead-air for this period — no need to publish).
+    pub fn current_window_delta(&mut self) -> Option<ClusterFrame> {
+        if self.partial_dirty.is_empty() || self.current_window_start_ns.is_none() {
             return None;
         }
-        Some(self.build_closing_snapshot())
+        self.sequence += 1;
+        let clusters: Vec<ClusterBucket> = self
+            .partial_dirty
+            .iter()
+            .map(|&price| {
+                let acc = &self.accum[&price];
+                ClusterBucket {
+                    price,
+                    bid_qty: acc.bid_qty,
+                    ask_qty: acc.ask_qty,
+                    trades: acc.trades,
+                }
+            })
+            .collect();
+        self.partial_dirty.clear();
+        Some(ClusterFrame::Snapshot(Arc::new(AnalyticsSnapshot {
+            window_start_ns: self.current_window_start_ns.unwrap_or(0),
+            sequence: self.sequence,
+            clusters,
+            open: self.open,
+            close: self.close,
+            high: self.high,
+            low: self.low,
+        })))
     }
 
     /// Force-emit the current window as a snapshot, then drop state.
@@ -207,6 +256,7 @@ impl Aggregator {
         let frame = self.build_closing_snapshot();
         self.accum.clear();
         self.dirty.clear();
+        self.partial_dirty.clear();
         self.current_window_start_ns = None;
         self.sequence = 0;
         self.last_diff_emit_ns = 0;
@@ -400,46 +450,65 @@ mod tests {
     }
 
     #[test]
-    fn current_window_snapshot_returns_none_on_empty_window() {
+    fn current_window_delta_returns_none_on_empty_window() {
         let mut a = agg();
-        assert!(a.current_window_snapshot().is_none());
+        assert!(a.current_window_delta().is_none());
     }
 
     #[test]
-    fn current_window_snapshot_emits_in_progress_state_without_resetting() {
+    fn current_window_delta_first_emit_includes_all_touched_buckets() {
         let mut a = agg();
-        // Оба trade в bucket 12340 (step=10): 12340/10*10=12340, 12348/10*10=12340.
+        // Два бакета: 12340 (12345→12340) и 12350 (12350→12350).
         a.ingest(trade(1_000, 12_345, 7, AggressorSide::Bid));
-        a.ingest(trade(2_000, 12_348, 3, AggressorSide::Ask));
+        a.ingest(trade(2_000, 12_350, 3, AggressorSide::Ask));
 
-        let f = a.current_window_snapshot().unwrap();
+        let f = a.current_window_delta().unwrap();
         let buckets = snapshot_buckets(&f);
-        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets.len(), 2, "оба бакета должны попасть в первый delta-emit");
         assert_eq!(buckets[0].price, 12_340);
         assert_eq!(buckets[0].bid_qty, 7);
-        assert_eq!(buckets[0].ask_qty, 3);
+        assert_eq!(buckets[1].price, 12_350);
+        assert_eq!(buckets[1].ask_qty, 3);
+    }
 
-        // Состояние НЕ сбрасывается — следующий trade добавляется к тому же бакету.
+    #[test]
+    fn current_window_delta_only_emits_touched_since_last() {
+        let mut a = agg();
+        a.ingest(trade(1_000, 12_345, 7, AggressorSide::Bid));
+        a.ingest(trade(2_000, 12_355, 3, AggressorSide::Ask));
+
+        // Первый delta: оба бакета.
+        let f1 = a.current_window_delta().unwrap();
+        assert_eq!(snapshot_buckets(&f1).len(), 2);
+
+        // Без новых трейдов — emit'а нет.
+        assert!(a.current_window_delta().is_none(),
+            "пустой partial_dirty → None");
+
+        // Новый трейд в один бакет → emit содержит только его, причём
+        // c полным накопленным значением (7+5=12), а не дельта-значением.
         a.ingest(trade(3_000, 12_343, 5, AggressorSide::Bid));
-        let f2 = a.current_window_snapshot().unwrap();
+        let f2 = a.current_window_delta().unwrap();
         let buckets2 = snapshot_buckets(&f2);
         assert_eq!(buckets2.len(), 1);
+        assert_eq!(buckets2[0].price, 12_340);
         assert_eq!(
             buckets2[0].bid_qty, 12,
-            "должно быть 7+5, а не сброс к 5 — partial-snapshot не должен трогать accum"
+            "delta должен содержать полное накопленное значение (7+5), не дельту"
         );
     }
 
     #[test]
-    fn current_window_snapshot_bumps_sequence_monotonically() {
+    fn current_window_delta_bumps_sequence_monotonically() {
         let mut a = agg();
         a.ingest(trade(1_000, 100, 1, AggressorSide::Bid));
-        let f1 = a.current_window_snapshot().unwrap();
+        let f1 = a.current_window_delta().unwrap();
         let s1 = match &f1 {
             ClusterFrame::Snapshot(s) => s.sequence,
             _ => panic!(),
         };
-        let f2 = a.current_window_snapshot().unwrap();
+        a.ingest(trade(2_000, 100, 1, AggressorSide::Bid));
+        let f2 = a.current_window_delta().unwrap();
         let s2 = match &f2 {
             ClusterFrame::Snapshot(s) => s.sequence,
             _ => panic!(),
@@ -448,14 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn current_window_snapshot_carries_ohlc() {
+    fn current_window_delta_carries_ohlc() {
         let mut a = agg();
         a.ingest(trade(1_000, 100, 1, AggressorSide::Bid)); // open=100
         a.ingest(trade(2_000, 150, 1, AggressorSide::Bid)); // high=150
         a.ingest(trade(3_000, 80, 1, AggressorSide::Bid));  // low=80
         a.ingest(trade(4_000, 120, 1, AggressorSide::Bid)); // close=120
 
-        let f = a.current_window_snapshot().unwrap();
+        let f = a.current_window_delta().unwrap();
         match f {
             ClusterFrame::Snapshot(s) => {
                 assert_eq!(s.open, 100);
@@ -465,6 +534,22 @@ mod tests {
             }
             _ => panic!("expected snapshot"),
         }
+    }
+
+    #[test]
+    fn current_window_delta_resets_on_window_roll() {
+        let mut a = agg();
+        // Окно 1: трейд в bucket 100.
+        a.ingest(trade(1_000_000, 100, 1, AggressorSide::Bid));
+        let _ = a.current_window_delta().unwrap();
+
+        // Roll в окно 2 — partial_dirty должен сброситься.
+        a.ingest(trade(60_000_000_001, 200, 1, AggressorSide::Bid));
+
+        let f = a.current_window_delta().unwrap();
+        let buckets = snapshot_buckets(&f);
+        assert_eq!(buckets.len(), 1, "после roll должен быть только новый бакет");
+        assert_eq!(buckets[0].price, 200);
     }
 
     #[test]

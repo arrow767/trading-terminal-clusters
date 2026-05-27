@@ -2,7 +2,14 @@ use dashmap::DashMap;
 use exchange_core::{ClusterFrame, StreamKey};
 use tokio::sync::broadcast;
 
-const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+/// Capacity broadcast-канала per (symbol × TF). 256 (старый дефолт)
+/// оказался мал: при backpressure CH-sink'а на одном TF подписчик
+/// блокировался на `ch_tx.send().await`, не успевал читать bus,
+/// получал `RecvError::Lagged` → закрывающие snapshot'ы окон
+/// дропались → отсутствие данных за целые окна в CH. 4096 даёт
+/// 16× больше буфера и при ~10-15 фреймах/сек на канал — это 4-7
+/// минут запаса, что обычно перекрывает CH-throttle спайки.
+const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
 
 /// Fan-out hub from the cluster aggregator to any number of live consumers
 /// (terminal push adapter, gRPC stream, metrics tap, etc.). One

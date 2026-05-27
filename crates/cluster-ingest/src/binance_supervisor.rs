@@ -337,22 +337,50 @@ impl BinanceSupervisor {
         }
 
         // Per-symbol trade fanout: получает трейд от session, раздаёт во
-        // все per-TF mpsc-каналы. try_send — чтобы ОДИН медленный TF
-        // не блокировал быстрые (то же поведение, что у session: лучше
-        // потерять кадр, чем застрять и получить WS-disconnect от Binance).
+        // все per-TF mpsc-каналы. `try_send` — чтобы ОДИН медленный TF
+        // не блокировал быстрые. На `Full` ведём per-TF счётчик: ранее
+        // дроп был тихим, что приводило к незаметному расхождению данных
+        // между TF (1m видит трейды, 5m их теряет). Теперь логируем
+        // нарастающую сумму с rate-limit'ом (раз в 5с per TF), чтобы
+        // оператор/диагностика сразу видели если канал недостаточен.
         let (session_tx, mut session_rx) = mpsc::channel(trade_bound);
         let symbol_for_log = spec.symbol.clone();
+        let tfs_for_log: Vec<u32> = self.ingest.timeframes_secs.clone();
         let fanout = tokio::spawn(async move {
+            // Параллельные счётчики: drops[i] относится к tf_trade_txs[i]
+            // → tfs_for_log[i]. Локальные (не Atomic'и) — fanout single-task.
+            let mut drops_full: Vec<u64> = vec![0; tf_trade_txs.len()];
+            let mut last_warn_ms: Vec<i64> = vec![0; tf_trade_txs.len()];
             while let Some(trade) = session_rx.recv().await {
-                for tx in &tf_trade_txs {
-                    if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(trade) {
-                        // Канал закрыт — этот TF-aggregator уже мёртв,
-                        // следующие итерации просто проходят мимо.
-                        // (Full → дропнули кадр, это OK.)
+                for (i, tx) in tf_trade_txs.iter().enumerate() {
+                    match tx.try_send(trade) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // TF-aggregator мёртв, дальше тоже мимо пройдёт.
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            drops_full[i] = drops_full[i].saturating_add(1);
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            // rate-limit: один warn раз в 5с на TF.
+                            if now_ms - last_warn_ms[i] >= 5_000 {
+                                tracing::warn!(
+                                    symbol = %symbol_for_log,
+                                    interval_seconds = tfs_for_log[i],
+                                    total_drops = drops_full[i],
+                                    "fanout: trade DROPPED — per-TF channel full \
+                                     (увеличь ingest.trade_channel_bound или \
+                                     ускорь aggregator/sink)"
+                                );
+                                last_warn_ms[i] = now_ms;
+                            }
+                        }
                     }
                 }
             }
-            tracing::debug!(symbol = %symbol_for_log, "trade fanout exiting");
+            tracing::debug!(symbol = %symbol_for_log, ?drops_full, "trade fanout exiting");
             // tf_trade_txs дропнутся вместе с этим scope → aggregators
             // увидят close → flush + exit.
         });
@@ -522,23 +550,38 @@ fn spawn_snapshot_to_ch(
     let mut sub = bus.subscribe(&stream_key);
     let interval = stream_key.interval_seconds;
     tokio::spawn(async move {
+        // Tracking: lag-flapping (когда bus стабильно отстаёт — ChWriter
+        // не справляется). Логируем нарастающий total, чтобы оператор
+        // видел реальный масштаб потерь, а не только последний всплеск.
+        let mut total_lagged: u64 = 0;
         loop {
             match sub.recv().await {
                 Ok(ClusterFrame::Snapshot(s)) => {
                     let rows = rows_from_snapshot(&s, &spec, &region);
                     for row in rows {
+                        // send().await блокирует если ch_tx полный — это
+                        // штатный backpressure: лучше подождать, чем
+                        // дропать ряды. Если ch_tx стабильно полный,
+                        // bus начнёт лагать → сработает ветка `Lagged`
+                        // ниже, оператор увидит warn.
                         if ch_tx.send(row).await.is_err() {
                             return;
                         }
                     }
                 }
-                Ok(ClusterFrame::Diff(_)) => {}
+                Ok(ClusterFrame::Diff(_)) => {
+                    // Diff (live-cluster gRPC stream) в CH не пишем —
+                    // только Snapshot. Diff'ы только для realtime подписчиков.
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    total_lagged = total_lagged.saturating_add(n);
                     tracing::warn!(
                         lagged = n,
+                        total_lagged,
                         symbol = %spec.symbol,
                         interval_seconds = interval,
-                        "ch fanout lagged behind bus"
+                        "ch fanout LAGGED — frames dropped (увеличь bus capacity \
+                         или ускорь ChWriter / увеличь ch_channel_bound)"
                     );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,

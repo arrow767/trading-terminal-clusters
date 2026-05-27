@@ -24,20 +24,24 @@ pub async fn run_aggregator(
     let mut ticker = interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    // Partial-snapshot тикер: каждые 3с публикуем snapshot текущего
-    // (ещё открытого) окна в bus, чтобы CH-sink его записал и REST
-    // `/v1/clusters/range` отдавал клиентам in-progress bar данные.
-    // Без этого пейн UI, открытый в середине окна, видит только то что
-    // его локальный аггрегатор успел собрать с момента подписки —
-    // первые N минут окна теряются. ReplacingMergeTree(ingested_at)
-    // дедуплицирует на чтении (FINAL), так что повторные записи одного
-    // (window_start, price) корректно сводятся к последней версии.
+    // Partial-snapshot тикер: каждую секунду публикуем DELTA текущего
+    // открытого окна в bus → CH-sink её записывает → REST
+    // `/v1/clusters/range` отдаёт клиентам in-progress bar данные.
     //
-    // Cadence жёстко 3с (не зависит от TF) — пользователь предпочёл
-    // ресурсы тратить ради актуальности. Гейтинг по `accum.is_empty()`
-    // внутри `current_window_snapshot` отсекает тихие символы / только
-    // что закрытые окна.
-    let mut partial_ticker = interval(PARTIAL_SNAPSHOT_INTERVAL);
+    // **Delta**, не full snapshot: эмитим только бакеты, изменённые
+    // с прошлого partial-emit (см. `Aggregator::current_window_delta`).
+    // Это критично — full snapshot каждую секунду × 2800 символов × 8 TF
+    // = миллионы строк/сек в CH, которые могут вызвать backpressure
+    // → переполнение bus → потерю closing-snapshot'ов целых окон.
+    // С delta нагрузка масштабируется реальной активностью трейдов.
+    //
+    // **Корректность при возможной потере delta'ы**: closing-snapshot
+    // на window-roll пишет ВСЕ бакеты с финальными значениями. Так как
+    // CH использует ReplacingMergeTree(ingested_at), closing-snapshot
+    // c самой поздней `ingested_at` всегда выигрывает FINAL дедуп —
+    // даже если N delta-эмитов потеряны, закрытие восстанавливает
+    // корректное состояние окна.
+    let mut partial_ticker = interval(PARTIAL_DELTA_INTERVAL);
     partial_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -64,7 +68,7 @@ pub async fn run_aggregator(
                 }
             }
             _ = partial_ticker.tick() => {
-                if let Some(frame) = agg.current_window_snapshot() {
+                if let Some(frame) = agg.current_window_delta() {
                     bus.publish(&stream_key, frame);
                 }
             }
@@ -72,11 +76,11 @@ pub async fn run_aggregator(
     }
 }
 
-/// Период публикации snapshot'ов открытого окна в bus. См. комментарий
-/// в `run_aggregator`. Менять только осознанно: уменьшение → больше
-/// write amplification в ClickHouse, увеличение → дольше gap для UI
-/// открывающегося в середине окна.
-const PARTIAL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
+/// Период публикации delta-snapshot'ов открытого окна в bus. См. коммент
+/// в `run_aggregator`. Уменьшение → точнее in-progress bar в UI, но больше
+/// нагрузки на CH-write; увеличение → дольше gap для пейна, открытого
+/// в середине окна.
+const PARTIAL_DELTA_INTERVAL: Duration = Duration::from_secs(1);
 
 fn now_ns() -> i64 {
     SystemTime::now()
