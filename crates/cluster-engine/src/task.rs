@@ -24,6 +24,22 @@ pub async fn run_aggregator(
     let mut ticker = interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Partial-snapshot тикер: каждые 3с публикуем snapshot текущего
+    // (ещё открытого) окна в bus, чтобы CH-sink его записал и REST
+    // `/v1/clusters/range` отдавал клиентам in-progress bar данные.
+    // Без этого пейн UI, открытый в середине окна, видит только то что
+    // его локальный аггрегатор успел собрать с момента подписки —
+    // первые N минут окна теряются. ReplacingMergeTree(ingested_at)
+    // дедуплицирует на чтении (FINAL), так что повторные записи одного
+    // (window_start, price) корректно сводятся к последней версии.
+    //
+    // Cadence жёстко 3с (не зависит от TF) — пользователь предпочёл
+    // ресурсы тратить ради актуальности. Гейтинг по `accum.is_empty()`
+    // внутри `current_window_snapshot` отсекает тихие символы / только
+    // что закрытые окна.
+    let mut partial_ticker = interval(PARTIAL_SNAPSHOT_INTERVAL);
+    partial_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             biased;
@@ -47,9 +63,20 @@ pub async fn run_aggregator(
                     bus.publish(&stream_key, frame);
                 }
             }
+            _ = partial_ticker.tick() => {
+                if let Some(frame) = agg.current_window_snapshot() {
+                    bus.publish(&stream_key, frame);
+                }
+            }
         }
     }
 }
+
+/// Период публикации snapshot'ов открытого окна в bus. См. комментарий
+/// в `run_aggregator`. Менять только осознанно: уменьшение → больше
+/// write amplification в ClickHouse, увеличение → дольше gap для UI
+/// открывающегося в середине окна.
+const PARTIAL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 
 fn now_ns() -> i64 {
     SystemTime::now()

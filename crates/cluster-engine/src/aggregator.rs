@@ -175,6 +175,29 @@ impl Aggregator {
         })))
     }
 
+    /// Emit a snapshot of the **current (still-open) window** without
+    /// mutating accum/OHLC/window state. Used by the runtime's periodic
+    /// partial-snapshot ticker so that clients fetching `/v1/clusters/range`
+    /// see in-progress bar data (which would otherwise live only in this
+    /// aggregator's RAM until window roll).
+    ///
+    /// Bumps `sequence` — partial-snapshot is a regular monotonic frame
+    /// on the bus, indistinguishable to subscribers from the closing one
+    /// except that more frames for the same `window_start_ns` may follow.
+    /// On the CH side, `ReplacingMergeTree(ingested_at)` dedupes per
+    /// `(exchange, market_type, symbol, window_start, price)` PK so each
+    /// new write overwrites the previous (latest `ingested_at` wins on
+    /// FINAL).
+    ///
+    /// Returns None if the window has no trades yet — emitting an empty
+    /// snapshot is pointless and would just waste a bus slot.
+    pub fn current_window_snapshot(&mut self) -> Option<ClusterFrame> {
+        if self.accum.is_empty() || self.current_window_start_ns.is_none() {
+            return None;
+        }
+        Some(self.build_closing_snapshot())
+    }
+
     /// Force-emit the current window as a snapshot, then drop state.
     /// Used at shutdown or when handing the symbol off to another node.
     pub fn flush(&mut self) -> Option<ClusterFrame> {
@@ -374,6 +397,74 @@ mod tests {
         assert!(a.tick(99_000_000).is_none());
         // At 100ms: at threshold, must emit.
         assert!(a.tick(100_000_000).is_some());
+    }
+
+    #[test]
+    fn current_window_snapshot_returns_none_on_empty_window() {
+        let mut a = agg();
+        assert!(a.current_window_snapshot().is_none());
+    }
+
+    #[test]
+    fn current_window_snapshot_emits_in_progress_state_without_resetting() {
+        let mut a = agg();
+        // Оба trade в bucket 12340 (step=10): 12340/10*10=12340, 12348/10*10=12340.
+        a.ingest(trade(1_000, 12_345, 7, AggressorSide::Bid));
+        a.ingest(trade(2_000, 12_348, 3, AggressorSide::Ask));
+
+        let f = a.current_window_snapshot().unwrap();
+        let buckets = snapshot_buckets(&f);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].price, 12_340);
+        assert_eq!(buckets[0].bid_qty, 7);
+        assert_eq!(buckets[0].ask_qty, 3);
+
+        // Состояние НЕ сбрасывается — следующий trade добавляется к тому же бакету.
+        a.ingest(trade(3_000, 12_343, 5, AggressorSide::Bid));
+        let f2 = a.current_window_snapshot().unwrap();
+        let buckets2 = snapshot_buckets(&f2);
+        assert_eq!(buckets2.len(), 1);
+        assert_eq!(
+            buckets2[0].bid_qty, 12,
+            "должно быть 7+5, а не сброс к 5 — partial-snapshot не должен трогать accum"
+        );
+    }
+
+    #[test]
+    fn current_window_snapshot_bumps_sequence_monotonically() {
+        let mut a = agg();
+        a.ingest(trade(1_000, 100, 1, AggressorSide::Bid));
+        let f1 = a.current_window_snapshot().unwrap();
+        let s1 = match &f1 {
+            ClusterFrame::Snapshot(s) => s.sequence,
+            _ => panic!(),
+        };
+        let f2 = a.current_window_snapshot().unwrap();
+        let s2 = match &f2 {
+            ClusterFrame::Snapshot(s) => s.sequence,
+            _ => panic!(),
+        };
+        assert!(s2 > s1, "sequence must strictly increase: {s1} → {s2}");
+    }
+
+    #[test]
+    fn current_window_snapshot_carries_ohlc() {
+        let mut a = agg();
+        a.ingest(trade(1_000, 100, 1, AggressorSide::Bid)); // open=100
+        a.ingest(trade(2_000, 150, 1, AggressorSide::Bid)); // high=150
+        a.ingest(trade(3_000, 80, 1, AggressorSide::Bid));  // low=80
+        a.ingest(trade(4_000, 120, 1, AggressorSide::Bid)); // close=120
+
+        let f = a.current_window_snapshot().unwrap();
+        match f {
+            ClusterFrame::Snapshot(s) => {
+                assert_eq!(s.open, 100);
+                assert_eq!(s.high, 150);
+                assert_eq!(s.low, 80);
+                assert_eq!(s.close, 120);
+            }
+            _ => panic!("expected snapshot"),
+        }
     }
 
     #[test]
