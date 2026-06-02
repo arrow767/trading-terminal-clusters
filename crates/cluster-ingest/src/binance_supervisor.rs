@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use crate::binance_session::{run_session as run_binance_session, SymbolRoute};
 use crate::bybit_session::run_session as run_bybit_session;
 use crate::config::{BinancePerpConfig, IngestConfig, RankBy};
+use crate::okx_session::run_session as run_okx_session;
 
 /// Какой session-runner использовать для данного supervisor'а.
 ///
@@ -30,6 +31,7 @@ use crate::config::{BinancePerpConfig, IngestConfig, RankBy};
 pub enum SessionFlavor {
     Binance,
     Bybit,
+    Okx,
 }
 
 /// One supervisor owns the entire pipeline for a single exchange:
@@ -494,6 +496,15 @@ async fn run_session_loop(
                         .downcast_ref::<exchange_bybit::BybitWs>()
                         .expect("SessionFlavor::Bybit requires BybitWs connector");
                     Box::pin(run_bybit_session(ws, &routes_snapshot, connect_timeout))
+                }
+                SessionFlavor::Okx => {
+                    // Инвариант как у Bybit: flavor=Okx ⇒ connector=OkxWs
+                    // (гарантируется конструированием в main.rs).
+                    let ws = connector
+                        .as_any()
+                        .downcast_ref::<exchange_okx::OkxWs>()
+                        .expect("SessionFlavor::Okx requires OkxWs connector");
+                    Box::pin(run_okx_session(ws, &routes_snapshot, connect_timeout))
                 }
             };
         tokio::select! {

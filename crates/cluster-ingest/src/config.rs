@@ -175,6 +175,12 @@ pub struct ExchangesConfig {
     pub bybit_perp: Option<BinancePerpConfig>,
     /// Bybit V5 spot (api.bybit.com /v5/spot, ws .../public/spot).
     pub bybit_spot: Option<BinancePerpConfig>,
+    /// OKX V5 USDT/USDC linear perpetual swaps (www.okx.com, ws /v5/public).
+    /// Той же формы BinancePerpConfig. Своп-qty переводится контракты→база
+    /// через ctVal внутри exchange-okx.
+    pub okx_perp: Option<BinancePerpConfig>,
+    /// OKX V5 spot (USDT/USDC).
+    pub okx_spot: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.

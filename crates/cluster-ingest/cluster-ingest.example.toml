@@ -60,9 +60,11 @@ tokens = ["REPLACE_ME_WITH_A_LONG_RANDOM_TOKEN"]
 # секция, не упомянутая в списке, не стартует даже с `enabled = true`.
 #
 # Поддерживаемые имена (сейчас в коде):
-#   - "binance_perp"
-# Будущие: "bybit_perp", "okx_perp", "bitget_perp", "mexc_perp", ...
-enabled_exchanges = ["binance_perp"]
+#   - "binance_perp", "binance_spot"
+#   - "bybit_perp", "bybit_spot"
+#   - "okx_perp", "okx_spot"
+# Будущие: "bitget_perp", "mexc_perp", ...
+enabled_exchanges = ["binance_perp", "binance_spot", "bybit_perp", "bybit_spot", "okx_perp", "okx_spot"]
 
 # Retention — сколько хранить строки в каждой таблице clusters_<tf>.
 # На старте ingest выпускает по `ALTER TABLE … MODIFY TTL …` per-table —
@@ -163,3 +165,30 @@ discovery_poll_secs = 300
 ws_connect_timeout_ms = 15000
 reconnect_backoff_min_ms = 500
 reconnect_backoff_max_ms = 30000
+
+# Bybit/OKX — та же форма BinancePerpConfig. OKX-своп qty приходит в
+# контрактах; exchange-okx переводит в базовый актив через ctVal, так что
+# серверные кластеры совпадают с live-движком терминала.
+[ingest.exchanges.bybit_perp]
+enabled = true
+include_quotes = ["USDT", "USDC"]
+top_n = 50
+rank_by = "volume_24h"
+
+[ingest.exchanges.bybit_spot]
+enabled = true
+include_quotes = ["USDT", "USDC"]
+top_n = 50
+rank_by = "volume_24h"
+
+[ingest.exchanges.okx_perp]
+enabled = true
+include_quotes = ["USDT", "USDC"]
+top_n = 50
+rank_by = "volume_24h"
+
+[ingest.exchanges.okx_spot]
+enabled = true
+include_quotes = ["USDT", "USDC"]
+top_n = 50
+rank_by = "volume_24h"

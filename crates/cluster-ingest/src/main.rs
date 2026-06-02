@@ -13,6 +13,7 @@ mod binance_session;
 mod binance_supervisor;
 mod bybit_session;
 mod config;
+mod okx_session;
 
 use binance_supervisor::{BinanceSupervisor, SessionFlavor};
 use config::{table_name_for, Config};
@@ -336,6 +337,70 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: bybit_spot");
     } else {
         tracing::info!("bybit_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── OKX linear swaps (USDT/USDC perps) ─────────────────────────────
+    // Один публичный WS endpoint на spot+swap; instId BTC-USDT-SWAP. Своп-qty
+    // в контрактах → база через ctVal внутри exchange-okx (см. scale::set_ct).
+    let okx_perp_cfg = ingest.exchanges.okx_perp.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("okx_perp", okx_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_okx::OkxInstrumentsInfo::new(
+            exchange_okx::OkxCategory::Swap,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_okx::OkxWs::swap());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Okx,
+            exchange_core::Exchange::OkxF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            okx_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: okx_perp");
+    } else {
+        tracing::info!("okx_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── OKX spot ───────────────────────────────────────────────────────
+    let okx_spot_cfg = ingest.exchanges.okx_spot.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("okx_spot", okx_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_okx::OkxInstrumentsInfo::new(
+            exchange_okx::OkxCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_okx::OkxWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Okx,
+            exchange_core::Exchange::Okx,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            okx_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: okx_spot");
+    } else {
+        tracing::info!("okx_spot not in enabled_exchanges; skipped");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а

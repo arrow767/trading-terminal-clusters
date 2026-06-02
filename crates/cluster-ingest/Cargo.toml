@@ -14,6 +14,7 @@ path = "src/main.rs"
 exchange-core = { path = "../exchange-core" }
 exchange-binance = { path = "../exchange-binance" }
 exchange-bybit = { path = "../exchange-bybit" }
+exchange-okx = { path = "../exchange-okx" }
 cluster-engine = { path = "../cluster-engine" }
 cluster-api = { path = "../cluster-api" }
 wal = { path = "../wal" }

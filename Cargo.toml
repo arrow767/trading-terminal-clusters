@@ -4,6 +4,7 @@ members = [
     "crates/exchange-core",
     "crates/exchange-binance",
     "crates/exchange-bybit",
+    "crates/exchange-okx",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",
