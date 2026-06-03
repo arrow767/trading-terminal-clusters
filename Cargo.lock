@@ -271,6 +271,7 @@ dependencies = [
  "exchange-binance",
  "exchange-bybit",
  "exchange-core",
+ "exchange-okx",
  "futures-util",
  "ops",
  "reqwest",
@@ -436,6 +437,19 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "exchange-okx"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
