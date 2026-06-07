@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 mod binance_session;
 mod binance_supervisor;
+mod bitget_session;
 mod bybit_session;
 mod config;
 mod okx_session;
@@ -401,6 +402,134 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: okx_spot");
     } else {
         tracing::info!("okx_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── Bitget USDT-margined linear perps ──────────────────────────────
+    // Один публичный WS endpoint на spot+perp; instId канон BTCUSDT. Линейные
+    // фьючи — qty уже в базе, контракт-множитель не нужен (в отличие от OKX).
+    let bitget_perp_cfg = ingest.exchanges.bitget_perp.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("bitget_perp", bitget_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_bitget::BitgetInstrumentsInfo::new(
+            exchange_bitget::BitgetCategory::Perp,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_bitget::BitgetWs::perp());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Bitget,
+            exchange_core::Exchange::BitgetF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            bitget_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: bitget_perp");
+    } else {
+        tracing::info!("bitget_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── Bitget spot ────────────────────────────────────────────────────
+    let bitget_spot_cfg = ingest.exchanges.bitget_spot.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("bitget_spot", bitget_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_bitget::BitgetInstrumentsInfo::new(
+            exchange_bitget::BitgetCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_bitget::BitgetWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Bitget,
+            exchange_core::Exchange::Bitget,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            bitget_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: bitget_spot");
+    } else {
+        tracing::info!("bitget_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── Aster linear perps (asterdex.com) ──────────────────────────────
+    // Клон combined-stream Binance → переиспользуем SessionFlavor::Binance
+    // (binance_session + BinanceFuturesTradeParser парсят Aster as-is).
+    let aster_perp_cfg = ingest.exchanges.aster_perp.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("aster_perp", aster_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_aster::AsterInstrumentsInfo::new(
+            exchange_aster::AsterCategory::Perp,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_aster::AsterWs::futures());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Binance,
+            exchange_core::Exchange::AsterF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            aster_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: aster_perp");
+    } else {
+        tracing::info!("aster_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── Aster spot ─────────────────────────────────────────────────────
+    let aster_spot_cfg = ingest.exchanges.aster_spot.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("aster_spot", aster_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_aster::AsterInstrumentsInfo::new(
+            exchange_aster::AsterCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_aster::AsterWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Binance,
+            exchange_core::Exchange::Aster,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            aster_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: aster_spot");
+    } else {
+        tracing::info!("aster_spot not in enabled_exchanges; skipped");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а

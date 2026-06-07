@@ -181,6 +181,17 @@ pub struct ExchangesConfig {
     pub okx_perp: Option<BinancePerpConfig>,
     /// OKX V5 spot (USDT/USDC).
     pub okx_spot: Option<BinancePerpConfig>,
+    /// Bitget V2 USDT-margined linear perps (api.bitget.com /api/v2/mix,
+    /// ws /v2/ws/public). Той же формы BinancePerpConfig. Линейные —
+    /// контракт-множитель не нужен (qty уже в базе).
+    pub bitget_perp: Option<BinancePerpConfig>,
+    /// Bitget V2 spot (USDT/USDC).
+    pub bitget_spot: Option<BinancePerpConfig>,
+    /// Aster (asterdex.com) USDT/USDC linear perps. Клон combined-stream
+    /// Binance — переиспользует binance session + trade parser.
+    pub aster_perp: Option<BinancePerpConfig>,
+    /// Aster spot (USDT/USDC).
+    pub aster_spot: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.

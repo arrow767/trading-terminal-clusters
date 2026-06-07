@@ -17,6 +17,8 @@ pub enum Exchange {
     KucoinF,
     Gate,
     GateF,
+    Aster,
+    AsterF,
 }
 
 impl Exchange {
@@ -35,6 +37,8 @@ impl Exchange {
             Exchange::KucoinF => "KUCOINF",
             Exchange::Gate => "GATE",
             Exchange::GateF => "GATEF",
+            Exchange::Aster => "ASTER",
+            Exchange::AsterF => "ASTERF",
         }
     }
 
@@ -48,6 +52,7 @@ impl Exchange {
                 | Exchange::Hyperliquid
                 | Exchange::KucoinF
                 | Exchange::GateF
+                | Exchange::AsterF
         )
     }
 }

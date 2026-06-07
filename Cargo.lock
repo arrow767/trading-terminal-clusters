@@ -418,6 +418,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "exchange-bitget"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "exchange-bybit"
 version = "0.1.0"
 dependencies = [
