@@ -273,6 +273,7 @@ dependencies = [
  "exchange-bitget",
  "exchange-bybit",
  "exchange-core",
+ "exchange-hyperliquid",
  "exchange-kucoin",
  "exchange-mexc",
  "exchange-okx",
@@ -467,6 +468,19 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "exchange-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

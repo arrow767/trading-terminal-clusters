@@ -200,6 +200,8 @@ pub struct ExchangesConfig {
     pub mexc_perp: Option<BinancePerpConfig>,
     /// MEXC spot (USDT/USDC; protobuf WS).
     pub mexc_spot: Option<BinancePerpConfig>,
+    /// Hyperliquid USDC-margined perps (DEX). Perp-only.
+    pub hyperliquid_perp: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.

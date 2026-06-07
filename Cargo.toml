@@ -9,6 +9,7 @@ members = [
     "crates/exchange-aster",
     "crates/exchange-kucoin",
     "crates/exchange-mexc",
+    "crates/exchange-hyperliquid",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",
