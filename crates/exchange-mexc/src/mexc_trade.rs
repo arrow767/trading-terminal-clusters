@@ -79,25 +79,38 @@ impl MexcFuturesTradeParser {
         };
         // contracts → base (perp).
         let (ct_n, ct_d) = get_ct(&spec.symbol);
-        let t_dir = data.get("T").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-        let Some(agg) = aggressor(t_dir) else {
-            return Ok(Vec::new());
+        // `push.deal` data is usually an ARRAY of {p,v,T,t}; tolerate a single
+        // object too.
+        let owned;
+        let items: &[serde_json::Value] = if let Some(arr) = data.as_array() {
+            arr
+        } else {
+            owned = [data.clone()];
+            &owned
         };
-        let px = num_str(data.get("p"));
-        let vol = num_str(data.get("v"));
-        if px.is_empty() || vol.is_empty() {
-            return Err(ExchangeError::Parse("mexc fut: missing p/v".into()));
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let t_dir = item.get("T").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let Some(agg) = aggressor(t_dir) else {
+                continue;
+            };
+            let px = num_str(item.get("p"));
+            let vol = num_str(item.get("v"));
+            if px.is_empty() || vol.is_empty() {
+                continue;
+            }
+            let price = parse_scaled(&px, spec.price_scale)?;
+            let qty = parse_scaled(&vol, spec.qty_scale)? * ct_n / ct_d;
+            let ts_ms = item.get("t").and_then(|x| x.as_i64()).unwrap_or(0);
+            out.push(TradePrint {
+                exchange_ts_ns: ts_ms.saturating_mul(1_000_000),
+                aggressor: agg,
+                price,
+                qty,
+                trade_id: 0,
+            });
         }
-        let price = parse_scaled(&px, spec.price_scale)?;
-        let qty = parse_scaled(&vol, spec.qty_scale)? * ct_n / ct_d;
-        let ts_ms = data.get("t").and_then(|x| x.as_i64()).unwrap_or(0);
-        Ok(vec![TradePrint {
-            exchange_ts_ns: ts_ms.saturating_mul(1_000_000),
-            aggressor: agg,
-            price,
-            qty,
-            trade_id: 0,
-        }])
+        Ok(out)
     }
 }
 
@@ -132,8 +145,9 @@ mod tests {
     #[test]
     fn futures_push_deal_contracts_to_base() {
         crate::scale::set_ct("BTCUSDT", 1, 10000);
+        // Real MEXC futures shape: data is an ARRAY of deals.
         let v: serde_json::Value = serde_json::from_str(
-            r#"{"channel":"push.deal","symbol":"BTC_USDT","data":{"p":67234.5,"v":100,"T":1,"t":1700000000123}}"#,
+            r#"{"channel":"push.deal","symbol":"BTC_USDT","data":[{"p":67234.5,"v":100,"T":1,"O":3,"M":1,"t":1700000000123,"i":"1"}]}"#,
         )
         .unwrap();
         let p = MexcFuturesTradeParser;
