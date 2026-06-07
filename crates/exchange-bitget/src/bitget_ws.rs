@@ -13,8 +13,10 @@ use exchange_core::{PingKind, SymbolSpec, WsConnector};
 
 pub const WS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 
-/// Консервативный батч на один subscribe-фрейм.
-const MAX_ARGS_PER_SUBSCRIBE: usize = 100;
+/// Консервативный батч на один subscribe-фрейм. Bitget закрывает коннект
+/// при слишком быстрой череде subscribe-фреймов — session шлёт их с
+/// небольшой паузой (см. `bitget_session`).
+const MAX_ARGS_PER_SUBSCRIBE: usize = 50;
 
 pub struct BitgetWs {
     is_perp: bool,
@@ -144,8 +146,8 @@ mod tests {
         let specs: Vec<SymbolSpec> = (0..250).map(|i| spec(&format!("S{i}USDT"), true)).collect();
         let refs: Vec<&SymbolSpec> = specs.iter().collect();
         let payloads = ws.subscribe_payloads_batched(&refs);
-        assert_eq!(payloads.len(), 3); // 100 + 100 + 50
-        let last: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+        assert_eq!(payloads.len(), 5); // 50 × 5
+        let last: serde_json::Value = serde_json::from_str(&payloads[4]).unwrap();
         assert_eq!(last["args"].as_array().unwrap().len(), 50);
     }
 

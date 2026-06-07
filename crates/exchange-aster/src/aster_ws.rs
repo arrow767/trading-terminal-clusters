@@ -1,22 +1,25 @@
-//! WsConnector для Aster (asterdex.com) — клон combined-stream Binance.
+//! WsConnector для Aster (asterdex.com) — клон Binance.
 //!
-//! Aster держит legacy-монолитный `/stream` endpoint (Binance Futures его
-//! выпилил 2026-04-23). Подписка — тот же `{"method":"SUBSCRIBE",...}`,
-//! envelope трейдов — `{"stream":..,"data":{aggTrade}}` (bit-for-bit Binance),
-//! поэтому в `cluster-ingest` переиспользуется `SessionFlavor::Binance` +
-//! `BinanceFuturesTradeParser` (он принимает и wrapped, и raw aggTrade).
+//! Используем RAW `/ws` endpoint + метод SUBSCRIBE (не combined `/stream`):
+//! на Aster futures плоский `/stream`+SUBSCRIBE отдаёт ack, но НЕ шлёт кадры
+//! (та же граблю, что Binance Futures чинит через `/market/stream`). А `/ws`
+//! доставляет raw-aggTrade и работает на scale. `BinanceFuturesTradeParser`
+//! принимает и raw, и wrapped формат, так что парсинг переиспользуется.
+//!
+//! Aster отклоняет ОДИН SUBSCRIBE с >~100 params (close 3001 "illegal
+//! request"), поэтому дробим на батчи и шлём с паузой (см. `aster_session`).
 //!
 //! Hosts:
-//!   - perp: `wss://fstream.asterdex.com/stream`
-//!   - spot: `wss://sstream.asterdex.com/stream`
-//!
-//! Keepalive: сервер шлёт ping'и (как Binance) → `ServerInitiated`; session
-//! отвечает pong'ом на каждый входящий ping-frame.
+//!   - perp: `wss://fstream.asterdex.com/ws`
+//!   - spot: `wss://sstream.asterdex.com/ws`
 
 use exchange_core::{PingKind, SymbolSpec, WsConnector};
 
-pub const FUTURES_WS_URL: &str = "wss://fstream.asterdex.com/stream";
-pub const SPOT_WS_URL: &str = "wss://sstream.asterdex.com/stream";
+pub const FUTURES_WS_URL: &str = "wss://fstream.asterdex.com/ws";
+pub const SPOT_WS_URL: &str = "wss://sstream.asterdex.com/ws";
+
+/// Aster отклоняет одиночный SUBSCRIBE с >~120 params — держим консервативно.
+const MAX_PARAMS_PER_SUBSCRIBE: usize = 100;
 
 pub struct AsterWs {
     ws_url: String,
@@ -36,6 +39,30 @@ impl AsterWs {
     pub fn with_url(url: impl Into<String>) -> Self {
         Self { ws_url: url.into() }
     }
+
+    /// Дробит symbol-set на batched SUBSCRIBE-фреймы (`@aggTrade`). Session
+    /// шлёт каждый отдельным WS-frame'ом с паузой между ними.
+    pub fn subscribe_payloads_batched(&self, symbols: &[&SymbolSpec]) -> Vec<String> {
+        if symbols.is_empty() {
+            return Vec::new();
+        }
+        symbols
+            .chunks(MAX_PARAMS_PER_SUBSCRIBE)
+            .enumerate()
+            .map(|(idx, chunk)| {
+                let params: Vec<String> = chunk
+                    .iter()
+                    .map(|s| format!("{}@aggTrade", s.symbol.to_lowercase()))
+                    .collect();
+                serde_json::json!({
+                    "method": "SUBSCRIBE",
+                    "params": params,
+                    "id": idx + 1,
+                })
+                .to_string()
+            })
+            .collect()
+    }
 }
 
 impl WsConnector for AsterWs {
@@ -44,16 +71,10 @@ impl WsConnector for AsterWs {
     }
 
     fn subscribe_payload(&self, symbols: &[&SymbolSpec]) -> String {
-        let params: Vec<String> = symbols
-            .iter()
-            .map(|s| format!("{}@aggTrade", s.symbol.to_lowercase()))
-            .collect();
-        serde_json::json!({
-            "method": "SUBSCRIBE",
-            "params": params,
-            "id": 1,
-        })
-        .to_string()
+        self.subscribe_payloads_batched(symbols)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| r#"{"method":"SUBSCRIBE","params":[],"id":1}"#.to_string())
     }
 
     fn ping_interval_ms(&self) -> u64 {
@@ -69,7 +90,7 @@ impl WsConnector for AsterWs {
     }
 
     fn max_subscriptions_per_socket(&self) -> usize {
-        200
+        1024
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -98,20 +119,23 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_payload_lowercases_and_appends_stream() {
+    fn subscribe_lowercases_and_batches() {
         let ws = AsterWs::futures();
-        let s1 = spec("BTCUSDT");
-        let s2 = spec("ETHUSDT");
-        let payload = ws.subscribe_payload(&[&s1, &s2]);
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(v["method"], "SUBSCRIBE");
-        assert_eq!(v["params"][0], "btcusdt@aggTrade");
-        assert_eq!(v["params"][1], "ethusdt@aggTrade");
+        let specs: Vec<SymbolSpec> = (0..250).map(|i| spec(&format!("S{i}USDT"))).collect();
+        let refs: Vec<&SymbolSpec> = specs.iter().collect();
+        let payloads = ws.subscribe_payloads_batched(&refs);
+        assert_eq!(payloads.len(), 3); // 100 + 100 + 50
+        let first: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(first["method"], "SUBSCRIBE");
+        assert_eq!(first["params"][0], "s0usdt@aggTrade");
+        assert_eq!(first["params"].as_array().unwrap().len(), 100);
+        let last: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+        assert_eq!(last["params"].as_array().unwrap().len(), 50);
     }
 
     #[test]
-    fn urls_are_aster_hosts() {
-        assert!(AsterWs::futures().ws_url().contains("fstream.asterdex.com"));
-        assert!(AsterWs::spot().ws_url().contains("sstream.asterdex.com"));
+    fn urls_are_aster_ws_hosts() {
+        assert!(AsterWs::futures().ws_url().contains("fstream.asterdex.com/ws"));
+        assert!(AsterWs::spot().ws_url().contains("sstream.asterdex.com/ws"));
     }
 }

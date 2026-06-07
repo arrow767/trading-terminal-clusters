@@ -9,6 +9,7 @@ use cluster_engine::ClusterBus;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+mod aster_session;
 mod binance_session;
 mod binance_supervisor;
 mod bitget_session;
@@ -483,7 +484,7 @@ async fn main() -> Result<()> {
             info,
             ranker,
             connector,
-            SessionFlavor::Binance,
+            SessionFlavor::Aster,
             exchange_core::Exchange::AsterF,
             exchange_core::MarketType::Perp,
             Arc::clone(&bus),
@@ -514,7 +515,7 @@ async fn main() -> Result<()> {
             info,
             ranker,
             connector,
-            SessionFlavor::Binance,
+            SessionFlavor::Aster,
             exchange_core::Exchange::Aster,
             exchange_core::MarketType::Spot,
             Arc::clone(&bus),

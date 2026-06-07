@@ -12,6 +12,7 @@ use exchange_core::{
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 
+use crate::aster_session::run_session as run_aster_session;
 use crate::binance_session::{run_session as run_binance_session, SymbolRoute};
 use crate::bitget_session::run_session as run_bitget_session;
 use crate::bybit_session::run_session as run_bybit_session;
@@ -34,6 +35,7 @@ pub enum SessionFlavor {
     Bybit,
     Okx,
     Bitget,
+    Aster,
 }
 
 /// One supervisor owns the entire pipeline for a single exchange:
@@ -515,6 +517,14 @@ async fn run_session_loop(
                         .downcast_ref::<exchange_bitget::BitgetWs>()
                         .expect("SessionFlavor::Bitget requires BitgetWs connector");
                     Box::pin(run_bitget_session(ws, &routes_snapshot, connect_timeout))
+                }
+                SessionFlavor::Aster => {
+                    // Инвариант: flavor=Aster ⇒ connector=AsterWs.
+                    let ws = connector
+                        .as_any()
+                        .downcast_ref::<exchange_aster::AsterWs>()
+                        .expect("SessionFlavor::Aster requires AsterWs connector");
+                    Box::pin(run_aster_session(ws, &routes_snapshot, connect_timeout))
                 }
             };
         tokio::select! {

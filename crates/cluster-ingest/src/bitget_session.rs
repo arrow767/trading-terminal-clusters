@@ -36,12 +36,17 @@ pub async fn run_session(
         .with_context(|| format!("ws connect to {url}"))?;
     let (mut sink, mut stream) = ws.split();
 
-    // BATCHED subscribe — каждый чанк отдельным фреймом.
+    // BATCHED subscribe — каждый чанк отдельным фреймом, С ПАУЗОЙ между ними.
+    // Bitget закрывает коннект (3001 / immediate "ws read") если subscribe-
+    // фреймы летят слишком быстро. 250мс между фреймами держит нас под
+    // rate-limit'ом и позволяет подписать весь universe (800+ символов) на
+    // одном сокете без реконнект-цикла.
     let spec_refs: Vec<&SymbolSpec> = routes.iter().map(|r| &r.spec).collect();
     for payload in connector.subscribe_payloads_batched(&spec_refs) {
         sink.send(Message::Text(payload))
             .await
             .context("bitget: send subscribe batch")?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     tracing::info!(symbols = routes.len(), "bitget session subscribed");
 
