@@ -196,6 +196,10 @@ pub struct ExchangesConfig {
     pub kucoin_perp: Option<BinancePerpConfig>,
     /// KuCoin spot (USDT/USDC).
     pub kucoin_spot: Option<BinancePerpConfig>,
+    /// MEXC futures (USDT/USDC perps; JSON WS, contract multiplier).
+    pub mexc_perp: Option<BinancePerpConfig>,
+    /// MEXC spot (USDT/USDC; protobuf WS).
+    pub mexc_spot: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.
