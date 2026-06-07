@@ -15,6 +15,7 @@ mod binance_supervisor;
 mod bitget_session;
 mod bybit_session;
 mod config;
+mod kucoin_session;
 mod okx_session;
 
 use binance_supervisor::{BinanceSupervisor, SessionFlavor};
@@ -531,6 +532,70 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: aster_spot");
     } else {
         tracing::info!("aster_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── KuCoin futures (USDT/USDC perps) ───────────────────────────────
+    // Bullet-token WS + шардинг + контракт-множитель — вся специфика в
+    // kucoin_session (SessionFlavor::Kucoin).
+    let kucoin_perp_cfg = ingest.exchanges.kucoin_perp.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("kucoin_perp", kucoin_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_kucoin::KucoinInstrumentsInfo::new(
+            exchange_kucoin::KucoinCategory::Perp,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_kucoin::KucoinWs::perp());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Kucoin,
+            exchange_core::Exchange::KucoinF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            kucoin_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: kucoin_perp");
+    } else {
+        tracing::info!("kucoin_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── KuCoin spot ────────────────────────────────────────────────────
+    let kucoin_spot_cfg = ingest.exchanges.kucoin_spot.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("kucoin_spot", kucoin_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_kucoin::KucoinInstrumentsInfo::new(
+            exchange_kucoin::KucoinCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_kucoin::KucoinWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Kucoin,
+            exchange_core::Exchange::Kucoin,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            kucoin_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: kucoin_spot");
+    } else {
+        tracing::info!("kucoin_spot not in enabled_exchanges; skipped");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а

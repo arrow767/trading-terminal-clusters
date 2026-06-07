@@ -7,6 +7,7 @@ members = [
     "crates/exchange-okx",
     "crates/exchange-bitget",
     "crates/exchange-aster",
+    "crates/exchange-kucoin",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",

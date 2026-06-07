@@ -192,6 +192,10 @@ pub struct ExchangesConfig {
     pub aster_perp: Option<BinancePerpConfig>,
     /// Aster spot (USDT/USDC).
     pub aster_spot: Option<BinancePerpConfig>,
+    /// KuCoin futures (USDT/USDC perps; bullet-token WS, contract multiplier).
+    pub kucoin_perp: Option<BinancePerpConfig>,
+    /// KuCoin spot (USDT/USDC).
+    pub kucoin_spot: Option<BinancePerpConfig>,
 }
 
 /// Сколько хранить строки `clusters_1m` до TTL-DELETE в ClickHouse.

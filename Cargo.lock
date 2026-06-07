@@ -273,6 +273,7 @@ dependencies = [
  "exchange-bitget",
  "exchange-bybit",
  "exchange-core",
+ "exchange-kucoin",
  "exchange-okx",
  "futures-util",
  "ops",
@@ -465,6 +466,19 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "exchange-kucoin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
