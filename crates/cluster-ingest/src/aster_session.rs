@@ -1,10 +1,14 @@
-//! Aster (asterdex.com) `/ws` SUBSCRIBE session loop.
+//! Aster (asterdex.com) `/ws` SUBSCRIBE session — SHARDED across connections.
 //!
 //! Aster — клон Binance, поэтому envelope трейдов и парсер те же
-//! (`BinanceFuturesTradeParser` принимает raw `/ws` aggTrade). Отличие от
-//! `binance_session` — подписка БАТЧАМИ С ПАУЗОЙ: Aster закрывает коннект
-//! (close 3001) если SUBSCRIBE содержит >~100 params или фреймы летят
-//! слишком быстро. Дробим на ≤100 params/frame и шлём с паузой 250мс.
+//! (`BinanceFuturesTradeParser` принимает raw `/ws` aggTrade). Два отличия
+//! от `binance_session`, продиктованные лимитами Aster `/ws`:
+//!   1. Один SUBSCRIBE с >~100 params → close `3001` (illegal request).
+//!   2. >~N каналов на ОДИН коннект → close `3003` (channels exceeds limit).
+//! Поэтому дробим universe на ШАРДЫ ≤100 символов и держим по одному
+//! WS-коннекту на шард (futures perp ~455 → ~5 коннектов). Каждый шард сам
+//! реконнектится; route-change/shutdown отменяет весь набор (futures не
+//! spawn'ятся — они часть этого future, см. supervisor select).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,6 +23,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::binance_session::{SessionStats, SymbolRoute};
 
+/// Символов на один WS-коннект. Под лимитом Aster `/ws` (≥120 ok, <455).
+const SHARD_SIZE: usize = 100;
+
 pub async fn run_session(
     connector: &AsterWs,
     routes: &[SymbolRoute],
@@ -28,6 +35,44 @@ pub async fn run_session(
         return Err(anyhow!("run_session called with no routes"));
     }
 
+    let shards: Vec<Vec<SymbolRoute>> = routes.chunks(SHARD_SIZE).map(|c| c.to_vec()).collect();
+    tracing::info!(
+        symbols = routes.len(),
+        shards = shards.len(),
+        "aster session: sharding across WS connections"
+    );
+
+    // Один reconnect-loop на шард, все конкурентно как ЧАСТЬ этого future
+    // (не tokio::spawn — иначе route-change их не отменит). join_all не
+    // вернётся (шарды крутятся вечно), пока supervisor не отменит future.
+    let futs = shards.iter().enumerate().map(|(idx, shard)| {
+        let shard = shard.clone();
+        async move {
+            let mut backoff = Duration::from_millis(500);
+            loop {
+                match run_one_shard(connector, &shard, connect_timeout, idx).await {
+                    Ok(()) => backoff = Duration::from_millis(500),
+                    Err(e) => {
+                        tracing::warn!(shard = idx, error = %e, "aster shard error; reconnecting");
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    });
+    futures_util::future::join_all(futs).await;
+    Ok(SessionStats::default())
+}
+
+/// One sharded WS connection: connect, subscribe (single ≤SHARD_SIZE frame),
+/// pump trades until disconnect/error.
+async fn run_one_shard(
+    connector: &AsterWs,
+    shard: &[SymbolRoute],
+    connect_timeout: Duration,
+    idx: usize,
+) -> Result<()> {
     let url = connector.ws_url();
     let connect = tokio_tungstenite::connect_async(url);
     let (ws, _resp) = tokio::time::timeout(connect_timeout, connect)
@@ -36,18 +81,17 @@ pub async fn run_session(
         .with_context(|| format!("ws connect to {url}"))?;
     let (mut sink, mut stream) = ws.split();
 
-    // BATCHED subscribe с паузой между фреймами (см. модульный комментарий).
-    let spec_refs: Vec<&SymbolSpec> = routes.iter().map(|r| &r.spec).collect();
+    // ≤SHARD_SIZE → ровно один subscribe-фрейм (под лимитом 3001).
+    let spec_refs: Vec<&SymbolSpec> = shard.iter().map(|r| &r.spec).collect();
     for payload in connector.subscribe_payloads_batched(&spec_refs) {
         sink.send(Message::Text(payload))
             .await
-            .context("aster: send subscribe batch")?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+            .context("aster: send subscribe")?;
     }
-    tracing::info!(symbols = routes.len(), "aster session subscribed");
+    tracing::info!(shard = idx, symbols = shard.len(), "aster shard subscribed");
 
-    let mut routing: HashMap<String, SymbolRoute> = HashMap::with_capacity(routes.len());
-    for r in routes {
+    let mut routing: HashMap<String, SymbolRoute> = HashMap::with_capacity(shard.len());
+    for r in shard {
         routing.insert(r.spec.symbol.to_ascii_uppercase(), r.clone());
     }
 
@@ -57,32 +101,24 @@ pub async fn run_session(
     loop {
         match stream.next().await {
             None => break,
-            Some(Ok(Message::Text(t))) => {
-                handle_payload(&parser, &routing, t.as_bytes(), &mut stats);
-            }
-            Some(Ok(Message::Binary(b))) => {
-                handle_payload(&parser, &routing, &b, &mut stats);
-            }
+            Some(Ok(Message::Text(t))) => handle_payload(&parser, &routing, t.as_bytes(), &mut stats),
+            Some(Ok(Message::Binary(b))) => handle_payload(&parser, &routing, &b, &mut stats),
             Some(Ok(Message::Ping(p))) => {
                 sink.send(Message::Pong(p)).await.context("send pong")?;
-                stats.pongs_sent += 1;
             }
             Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
             Some(Ok(Message::Close(frame))) => {
-                tracing::info!(?frame, "aster ws close received");
+                tracing::info!(shard = idx, ?frame, "aster ws close received");
                 break;
             }
             Some(Err(e)) if is_soft_close(&e) => {
-                tracing::info!(error = %e, "aster ws session ended (peer hung up)");
+                tracing::info!(shard = idx, error = %e, "aster ws ended (peer hung up)");
                 break;
             }
-            Some(Err(e)) => {
-                return Err(anyhow::Error::from(e).context("aster ws read"));
-            }
+            Some(Err(e)) => return Err(anyhow::Error::from(e).context("aster ws read")),
         }
     }
-
-    Ok(stats)
+    Ok(())
 }
 
 fn is_soft_close(e: &tokio_tungstenite::tungstenite::Error) -> bool {
