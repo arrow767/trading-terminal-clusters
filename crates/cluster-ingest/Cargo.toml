@@ -18,6 +18,7 @@ exchange-okx = { path = "../exchange-okx" }
 exchange-bitget = { path = "../exchange-bitget" }
 exchange-aster = { path = "../exchange-aster" }
 exchange-kucoin = { path = "../exchange-kucoin" }
+exchange-mexc = { path = "../exchange-mexc" }
 cluster-engine = { path = "../cluster-engine" }
 cluster-api = { path = "../cluster-api" }
 wal = { path = "../wal" }

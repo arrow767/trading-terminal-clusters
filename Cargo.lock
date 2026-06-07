@@ -274,6 +274,7 @@ dependencies = [
  "exchange-bybit",
  "exchange-core",
  "exchange-kucoin",
+ "exchange-mexc",
  "exchange-okx",
  "futures-util",
  "ops",
@@ -470,6 +471,19 @@ dependencies = [
 
 [[package]]
 name = "exchange-kucoin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "exchange-mexc"
 version = "0.1.0"
 dependencies = [
  "async-trait",

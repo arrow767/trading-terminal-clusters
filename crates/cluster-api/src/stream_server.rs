@@ -164,6 +164,8 @@ fn parse_exchange(s: &str) -> Option<Exchange> {
         "GATEF" => Exchange::GateF,
         "ASTER" => Exchange::Aster,
         "ASTERF" => Exchange::AsterF,
+        "MEXC" => Exchange::Mexc,
+        "MEXCF" => Exchange::MexcF,
         _ => return None,
     })
 }

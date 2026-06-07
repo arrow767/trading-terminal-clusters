@@ -19,6 +19,8 @@ pub enum Exchange {
     GateF,
     Aster,
     AsterF,
+    Mexc,
+    MexcF,
 }
 
 impl Exchange {
@@ -39,6 +41,8 @@ impl Exchange {
             Exchange::GateF => "GATEF",
             Exchange::Aster => "ASTER",
             Exchange::AsterF => "ASTERF",
+            Exchange::Mexc => "MEXC",
+            Exchange::MexcF => "MEXCF",
         }
     }
 
@@ -53,6 +57,7 @@ impl Exchange {
                 | Exchange::KucoinF
                 | Exchange::GateF
                 | Exchange::AsterF
+                | Exchange::MexcF
         )
     }
 }

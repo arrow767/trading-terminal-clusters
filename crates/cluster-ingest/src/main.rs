@@ -16,6 +16,7 @@ mod bitget_session;
 mod bybit_session;
 mod config;
 mod kucoin_session;
+mod mexc_session;
 mod okx_session;
 
 use binance_supervisor::{BinanceSupervisor, SessionFlavor};
@@ -596,6 +597,69 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: kucoin_spot");
     } else {
         tracing::info!("kucoin_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── MEXC futures (USDT/USDC perps) ─────────────────────────────────
+    // JSON WS (contract.mexc.com/edge), sub.deal per symbol, контракт-множитель.
+    let mexc_perp_cfg = ingest.exchanges.mexc_perp.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("mexc_perp", mexc_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_mexc::MexcInstrumentsInfo::new(
+            exchange_mexc::MexcCategory::Perp,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_mexc::MexcWs::perp());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Mexc,
+            exchange_core::Exchange::MexcF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            mexc_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: mexc_perp");
+    } else {
+        tracing::info!("mexc_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── MEXC spot (protobuf WS) ─────────────────────────────────────────
+    let mexc_spot_cfg = ingest.exchanges.mexc_spot.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("mexc_spot", mexc_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_mexc::MexcInstrumentsInfo::new(
+            exchange_mexc::MexcCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_mexc::MexcWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Mexc,
+            exchange_core::Exchange::Mexc,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            mexc_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: mexc_spot");
+    } else {
+        tracing::info!("mexc_spot not in enabled_exchanges; skipped");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а
