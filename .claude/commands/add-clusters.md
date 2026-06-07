@@ -54,7 +54,7 @@ history-колонка двоится. **Порти scale-логику из live
 - `config.rs`: `ExchangesConfig += x_perp / x_spot: Option<BinancePerpConfig>`.
 - `cluster-ingest.example.toml`: секции + `enabled_exchanges`.
 
-### 4. Деплой (хост 45.89.109.145, creds даёт юзер)
+### 4. Деплой (хост 202.182.100.188, ssh-ключ ~/.ssh/clusters_vultr)
 - `git commit` + `git push origin main`.
 - На сервере: `cd /opt/clusters/repo && git pull --ff-only origin main` →
   `~/.cargo/bin/cargo build --release -p cluster-ingest`. **Сборка не трогает живой
