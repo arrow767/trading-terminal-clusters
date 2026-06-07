@@ -5,6 +5,8 @@ members = [
     "crates/exchange-binance",
     "crates/exchange-bybit",
     "crates/exchange-okx",
+    "crates/exchange-bitget",
+    "crates/exchange-aster",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",

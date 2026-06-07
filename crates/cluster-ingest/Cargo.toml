@@ -15,6 +15,8 @@ exchange-core = { path = "../exchange-core" }
 exchange-binance = { path = "../exchange-binance" }
 exchange-bybit = { path = "../exchange-bybit" }
 exchange-okx = { path = "../exchange-okx" }
+exchange-bitget = { path = "../exchange-bitget" }
+exchange-aster = { path = "../exchange-aster" }
 cluster-engine = { path = "../cluster-engine" }
 cluster-api = { path = "../cluster-api" }
 wal = { path = "../wal" }

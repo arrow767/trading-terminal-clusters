@@ -268,7 +268,9 @@ dependencies = [
  "clickhouse-sink",
  "cluster-api",
  "cluster-engine",
+ "exchange-aster",
  "exchange-binance",
+ "exchange-bitget",
  "exchange-bybit",
  "exchange-core",
  "exchange-okx",
@@ -405,7 +407,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "exchange-aster"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "exchange-binance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "exchange-bitget"
 version = "0.1.0"
 dependencies = [
  "async-trait",
