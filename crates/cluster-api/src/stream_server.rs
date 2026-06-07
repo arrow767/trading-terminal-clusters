@@ -158,6 +158,7 @@ fn parse_exchange(s: &str) -> Option<Exchange> {
         "OKX" => Exchange::Okx,
         "OKXF" => Exchange::OkxF,
         "HYPERLIQUID" => Exchange::Hyperliquid,
+        "HYPERLIQUIDF" => Exchange::HyperliquidF,
         "KUCOIN" => Exchange::Kucoin,
         "KUCOINF" => Exchange::KucoinF,
         "GATE" => Exchange::Gate,

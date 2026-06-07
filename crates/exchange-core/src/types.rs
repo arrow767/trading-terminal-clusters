@@ -13,6 +13,7 @@ pub enum Exchange {
     Okx,
     OkxF,
     Hyperliquid,
+    HyperliquidF,
     Kucoin,
     KucoinF,
     Gate,
@@ -35,6 +36,7 @@ impl Exchange {
             Exchange::Okx => "OKX",
             Exchange::OkxF => "OKXF",
             Exchange::Hyperliquid => "HYPERLIQUID",
+            Exchange::HyperliquidF => "HYPERLIQUIDF",
             Exchange::Kucoin => "KUCOIN",
             Exchange::KucoinF => "KUCOINF",
             Exchange::Gate => "GATE",
@@ -54,6 +56,7 @@ impl Exchange {
                 | Exchange::BitgetF
                 | Exchange::OkxF
                 | Exchange::Hyperliquid
+                | Exchange::HyperliquidF
                 | Exchange::KucoinF
                 | Exchange::GateF
                 | Exchange::AsterF

@@ -88,7 +88,10 @@ pub(crate) fn parse_meta(json: &str) -> Result<Vec<SymbolSpec>> {
         set_native(&canonical, name);
         let price_scale = MAX_DECIMALS_PERP.saturating_sub(sz_decimals);
         out.push(SymbolSpec {
-            exchange: Exchange::Hyperliquid,
+            // Perps use the F wire-id to match the terminal (HYPERLIQUIDF=perp,
+            // HYPERLIQUID=spot). The plain `Hyperliquid` variant is reserved for
+            // spot (not ingested here).
+            exchange: Exchange::HyperliquidF,
             market_type: MarketType::Perp,
             quote: Quote::Usdc,
             symbol: canonical,
@@ -119,7 +122,7 @@ mod tests {
         let specs = parse_meta(META).unwrap();
         assert_eq!(specs.len(), 3); // DEAD delisted skipped
         let btc = specs.iter().find(|s| s.symbol == "BTCUSDC").unwrap();
-        assert_eq!(btc.exchange, Exchange::Hyperliquid);
+        assert_eq!(btc.exchange, Exchange::HyperliquidF);
         assert_eq!(btc.market_type, MarketType::Perp);
         assert_eq!(btc.quote, Quote::Usdc);
         // price_scale = 6 - 5 = 1; qty_scale = 5

@@ -675,7 +675,7 @@ async fn main() -> Result<()> {
             ranker,
             connector,
             SessionFlavor::Hyperliquid,
-            exchange_core::Exchange::Hyperliquid,
+            exchange_core::Exchange::HyperliquidF,
             exchange_core::MarketType::Perp,
             Arc::clone(&bus),
             ingest.region.clone(),
