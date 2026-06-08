@@ -382,9 +382,12 @@ fn build_range_sql(db: &str, q: &RangeParams) -> String {
     //       оконных функций, чтобы не зависеть от их поддержки).
     let n = q.interval_seconds;
     let base = table_name_for(60); // clusters_1m — общий делитель всех ≥1m TF
+    // NB: toStartOfInterval(.., SECOND) → DateTime (not DateTime64), so
+    // toUnixTimestamp64Milli rejects it. Windows are second-aligned →
+    // seconds*1000 = ms exactly.
     format!(
         "SELECT \
-           toUnixTimestamp64Milli(b.rw) AS ts_ms, \
+           toUnixTimestamp(b.rw) * 1000 AS ts_ms, \
            b.price, b.bid_qty, b.ask_qty, b.trades, b.ps, b.qs, \
            w.o, w.c, w.h, w.l \
          FROM ( \
