@@ -149,48 +149,10 @@ pub async fn cluster_range(
             .into_response();
     }
 
-    let table = table_name_for(q.interval_seconds);
-
-    // CH SQL. Параметры приходят с REST — экранируем как литералы.
-    // Альтернатива (параметрические запросы) добавит сложности без выгоды:
-    // символы/market — простые ASCII (валидированы выше), кавычки
-    // экранируем для защиты от чёрта-в-имени.
-    //
-    // OHLC доступны на каждой строке (одинаковые для всех bucket'ов окна
-    // — sink повторяет), мы их забираем как `any(open) OVER (PARTITION BY
-    // window_start)` через window-функцию, чтобы при сортировке остался
-    // ровно один OHLC на window. Можно было бы и просто `open` — но если
-    // в CH окажется bucket с другим OHLC (теоретически невозможно при
-    // правильной ingest-логике, но defensive), `any()` выбирает любое
-    // значение детерминированно.
-    let sql = format!(
-        "SELECT \
-           toUnixTimestamp64Milli(window_start) AS ts_ms, \
-           price, bid_qty, ask_qty, trades, \
-           any(price_scale) OVER () AS ps, \
-           any(qty_scale) OVER () AS qs, \
-           any(open) OVER (PARTITION BY window_start) AS o, \
-           any(close) OVER (PARTITION BY window_start) AS c, \
-           any(high) OVER (PARTITION BY window_start) AS h, \
-           any(low) OVER (PARTITION BY window_start) AS l \
-         FROM {db}.{table} FINAL \
-         WHERE exchange = '{ex}' AND market_type = '{mt}' AND symbol = '{sym}' \
-           AND window_start >= fromUnixTimestamp64Milli({from}) \
-           AND window_start <  fromUnixTimestamp64Milli({to}) \
-         ORDER BY window_start, price \
-         FORMAT JSONCompactEachRow",
-        db = state.ch_database,
-        table = table,
-        ex = sql_escape(&q.exchange),
-        mt = sql_escape(&q.market_type),
-        sym = sql_escape(&q.symbol),
-        from = q.from_ms,
-        to = q.to_ms,
-    );
-
-    // FINAL форсирует ReplacingMergeTree дедуп late-arriving cross-region
-    // дублей. Дороже, чем без FINAL, но критично корректнее: иначе UI
-    // может получить две версии одного бара, прыгающие при ре-фетче.
+    // SQL: прямое чтение для базовых TF (30s/1m), иначе rollup из 1m.
+    // FINAL форсирует ReplacingMergeTree дедуп late-arriving дублей —
+    // критично корректнее: иначе UI получит две версии одного бара.
+    let sql = build_range_sql(&state.ch_database, &q);
 
     let url = format!("{}/?query={}", state.ch_url.trim_end_matches('/'), urlencode(&sql));
     let mut req = state.ch_client.get(&url);
@@ -366,6 +328,92 @@ pub async fn cluster_range(
     (StatusCode::OK, headers, Json(out)).into_response()
 }
 
+/// Build the CH query for a range request.
+///
+/// Только базовые TF (30s, 1m) живут в CH как отдельные таблицы — их пишет
+/// ingest. Остальные (5m/15m/30m/1h/4h/1d) НЕ агрегируются в RAM, а
+/// **досчитываются из `clusters_1m` на чтении** (rollup): footprint аддитивен
+/// по времени, поэтому bucket за длинное окно = сумма bucket'ов 1m-под-окон с
+/// тем же price. Границы окна (`toStartOfInterval(.., N SECOND, 'UTC')`)
+/// совпадают byte-в-byte с тем, что выдал бы живой аггрегатор
+/// (`window_start = t - t % (N*1000)` от epoch UTC), так что прямые и
+/// досчитанные окна консистентны.
+///
+/// Обе ветки возвращают 11 колонок в одном порядке —
+/// `[ts_ms, price, bid_qty, ask_qty, trades, price_scale, qty_scale, open, close, high, low]` —
+/// так что парсер ответа общий.
+fn build_range_sql(db: &str, q: &RangeParams) -> String {
+    let ex = sql_escape(&q.exchange);
+    let mt = sql_escape(&q.market_type);
+    let sym = sql_escape(&q.symbol);
+    let filter = format!(
+        "exchange = '{ex}' AND market_type = '{mt}' AND symbol = '{sym}' \
+         AND window_start >= fromUnixTimestamp64Milli({from}) \
+         AND window_start <  fromUnixTimestamp64Milli({to})",
+        from = q.from_ms,
+        to = q.to_ms,
+    );
+
+    if matches!(q.interval_seconds, 30 | 60) {
+        // Прямое чтение базовой таблицы. OHLC — оконной функцией, чтобы
+        // получить ровно один на window (sink дублирует по bucket'ам).
+        let table = table_name_for(q.interval_seconds);
+        return format!(
+            "SELECT \
+               toUnixTimestamp64Milli(window_start) AS ts_ms, \
+               price, bid_qty, ask_qty, trades, \
+               any(price_scale) OVER () AS ps, \
+               any(qty_scale) OVER () AS qs, \
+               any(open) OVER (PARTITION BY window_start) AS o, \
+               any(close) OVER (PARTITION BY window_start) AS c, \
+               any(high) OVER (PARTITION BY window_start) AS h, \
+               any(low) OVER (PARTITION BY window_start) AS l \
+             FROM {db}.{table} FINAL \
+             WHERE {filter} \
+             ORDER BY window_start, price \
+             FORMAT JSONCompactEachRow",
+        );
+    }
+
+    // Rollup из 1m. Две агрегации над одним отфильтрованным срезом:
+    //   b — per (rolled_window, price): сумма bid/ask/trades (+ scale).
+    //   w — per rolled_window: OHLC (open=первое под-окно, close=последнее,
+    //       high=max, low=min) через argMin/argMax (plain-агрегаты — без
+    //       оконных функций, чтобы не зависеть от их поддержки).
+    let n = q.interval_seconds;
+    let base = table_name_for(60); // clusters_1m — общий делитель всех ≥1m TF
+    // NB: toStartOfInterval(.., SECOND) → DateTime (not DateTime64), so
+    // toUnixTimestamp64Milli rejects it. Windows are second-aligned →
+    // seconds*1000 = ms exactly.
+    format!(
+        "SELECT \
+           toUnixTimestamp(b.rw) * 1000 AS ts_ms, \
+           b.price, b.bid_qty, b.ask_qty, b.trades, b.ps, b.qs, \
+           w.o, w.c, w.h, w.l \
+         FROM ( \
+           SELECT \
+             toStartOfInterval(window_start, INTERVAL {n} SECOND, 'UTC') AS rw, \
+             price, \
+             sum(bid_qty) AS bid_qty, sum(ask_qty) AS ask_qty, sum(trades) AS trades, \
+             any(price_scale) AS ps, any(qty_scale) AS qs \
+           FROM {db}.{base} FINAL \
+           WHERE {filter} \
+           GROUP BY rw, price \
+         ) AS b \
+         INNER JOIN ( \
+           SELECT \
+             toStartOfInterval(window_start, INTERVAL {n} SECOND, 'UTC') AS rw, \
+             argMin(open, window_start) AS o, argMax(close, window_start) AS c, \
+             max(high) AS h, min(low) AS l \
+           FROM {db}.{base} FINAL \
+           WHERE {filter} \
+           GROUP BY rw \
+         ) AS w ON b.rw = w.rw \
+         ORDER BY ts_ms, b.price \
+         FORMAT JSONCompactEachRow",
+    )
+}
+
 fn validate_params(q: &RangeParams) -> Result<(), String> {
     if q.symbol.is_empty() || q.symbol.len() > 32 {
         return Err("symbol: required, max 32 chars".into());
@@ -526,5 +574,30 @@ mod tests {
     fn sql_escape_quotes_a_single_quote() {
         assert_eq!(sql_escape("hello"), "hello");
         assert_eq!(sql_escape("o'brien"), "o''brien");
+    }
+
+    #[test]
+    fn base_tfs_read_their_table_directly() {
+        let s30 = build_range_sql("clusters", &p(30, 0, 60_000));
+        assert!(s30.contains("clusters.clusters_30s FINAL"));
+        assert!(!s30.contains("toStartOfInterval"), "30s must not roll up");
+        let s60 = build_range_sql("clusters", &p(60, 0, 60_000));
+        assert!(s60.contains("clusters.clusters_1m FINAL"));
+        assert!(!s60.contains("toStartOfInterval"), "1m must not roll up");
+    }
+
+    #[test]
+    fn long_tfs_roll_up_from_1m() {
+        for iv in [300u32, 900, 1800, 3600, 14400, 86400] {
+            let s = build_range_sql("clusters", &p(iv, 0, 86_400_000));
+            assert!(s.contains("clusters.clusters_1m FINAL"), "{iv}: base must be 1m");
+            assert!(!s.contains("clusters_5m") && !s.contains("clusters_1d"),
+                "{iv}: must not touch the stale per-TF tables");
+            assert!(s.contains(&format!("INTERVAL {iv} SECOND")), "{iv}: rolled boundary");
+            assert!(s.contains("sum(bid_qty)") && s.contains("argMin(open"),
+                "{iv}: additive buckets + window OHLC");
+            // 11-column output order preserved for the shared parser.
+            assert!(s.contains("b.price, b.bid_qty, b.ask_qty, b.trades, b.ps, b.qs, w.o, w.c, w.h, w.l"));
+        }
     }
 }
