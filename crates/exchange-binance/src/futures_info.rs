@@ -125,7 +125,12 @@ pub(crate) fn parse_exchange_info(json: &str) -> Result<Vec<SymbolSpec>> {
     for s in symbols {
         let contract_type = s.get("contractType").and_then(|v| v.as_str()).unwrap_or("");
         let status = s.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if contract_type != "PERPETUAL" || status != "TRADING" {
+        // Accept crypto perps AND Binance "TradFi" perps (TRADIFI_PERPETUAL —
+        // tokenized stocks/ETFs/indices: AAPL/AMD/SNDK/EWY/COIN/GOOGL/…). Both are
+        // linear USDT/USDC perps on the same fapi WS, so they ingest identically;
+        // only dated delivery (CURRENT_QUARTER/NEXT_QUARTER) stays excluded.
+        let is_perp = matches!(contract_type, "PERPETUAL" | "TRADIFI_PERPETUAL");
+        if !is_perp || status != "TRADING" {
             continue;
         }
 
@@ -243,6 +248,18 @@ mod tests {
           ]
         },
         {
+          "symbol": "AAPLUSDT",
+          "contractType": "TRADIFI_PERPETUAL",
+          "status": "TRADING",
+          "quoteAsset": "USDT",
+          "pricePrecision": 2,
+          "quantityPrecision": 3,
+          "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "LOT_SIZE", "stepSize": "0.001"}
+          ]
+        },
+        {
           "symbol": "BTCUSDT_240927",
           "contractType": "CURRENT_QUARTER",
           "status": "TRADING",
@@ -276,7 +293,15 @@ mod tests {
     #[test]
     fn parses_perp_usdt_and_usdc_filters_others() {
         let specs = parse_exchange_info(FIXTURE).unwrap();
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 3); // BTCUSDT + ETHUSDC + AAPLUSDT; BUSD/quarter/non-trading excluded
+
+        // TradFi perp (tokenized stock) ingests like any linear USDT perp.
+        let aapl = specs
+            .iter()
+            .find(|s| s.symbol == "AAPLUSDT")
+            .expect("TRADIFI_PERPETUAL must be included");
+        assert_eq!(aapl.market_type, MarketType::Perp);
+        assert_eq!(aapl.quote, Quote::Usdt);
 
         let btc = specs.iter().find(|s| s.symbol == "BTCUSDT").unwrap();
         assert_eq!(btc.exchange, Exchange::BinanceF);
