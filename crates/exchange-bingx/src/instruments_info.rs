@@ -218,7 +218,7 @@ mod tests {
       {"symbol":"BTC-USDT","tickSize":0.01,"stepSize":0.000001,"status":1},
       {"symbol":"RIVER-USDT","tickSize":0.05,"stepSize":0.01,"status":1},
       {"symbol":"OFF-USDT","tickSize":0.01,"stepSize":0.01,"status":0}
-    ]}"#;
+    ]}}"#;
 
     #[test]
     fn parses_swap_no_contract_mult() {
