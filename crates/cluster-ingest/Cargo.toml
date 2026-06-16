@@ -20,6 +20,7 @@ exchange-aster = { path = "../exchange-aster" }
 exchange-kucoin = { path = "../exchange-kucoin" }
 exchange-mexc = { path = "../exchange-mexc" }
 exchange-hyperliquid = { path = "../exchange-hyperliquid" }
+exchange-bingx = { path = "../exchange-bingx" }
 cluster-engine = { path = "../cluster-engine" }
 cluster-api = { path = "../cluster-api" }
 wal = { path = "../wal" }
@@ -28,6 +29,7 @@ ops = { path = "../ops" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+flate2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

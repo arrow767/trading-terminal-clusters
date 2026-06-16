@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use crate::aster_session::run_session as run_aster_session;
 use crate::binance_session::{run_session as run_binance_session, SymbolRoute};
 use crate::bitget_session::run_session as run_bitget_session;
+use crate::bingx_session::run_session as run_bingx_session;
 use crate::hyperliquid_session::run_session as run_hyperliquid_session;
 use crate::kucoin_session::run_session as run_kucoin_session;
 use crate::mexc_session::run_session as run_mexc_session;
@@ -42,6 +43,7 @@ pub enum SessionFlavor {
     Kucoin,
     Mexc,
     Hyperliquid,
+    Bingx,
 }
 
 /// One supervisor owns the entire pipeline for a single exchange:
@@ -555,6 +557,14 @@ async fn run_session_loop(
                         .downcast_ref::<exchange_hyperliquid::HyperliquidWs>()
                         .expect("SessionFlavor::Hyperliquid requires HyperliquidWs connector");
                     Box::pin(run_hyperliquid_session(ws, &routes_snapshot, connect_timeout))
+                }
+                SessionFlavor::Bingx => {
+                    // Инвариант: flavor=Bingx ⇒ connector=BingxWs.
+                    let ws = connector
+                        .as_any()
+                        .downcast_ref::<exchange_bingx::BingxWs>()
+                        .expect("SessionFlavor::Bingx requires BingxWs connector");
+                    Box::pin(run_bingx_session(ws, &routes_snapshot, connect_timeout))
                 }
             };
         tokio::select! {

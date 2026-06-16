@@ -22,6 +22,8 @@ pub enum Exchange {
     AsterF,
     Mexc,
     MexcF,
+    Bingx,
+    BingxF,
 }
 
 impl Exchange {
@@ -45,6 +47,8 @@ impl Exchange {
             Exchange::AsterF => "ASTERF",
             Exchange::Mexc => "MEXC",
             Exchange::MexcF => "MEXCF",
+            Exchange::Bingx => "BINGX",
+            Exchange::BingxF => "BINGXF",
         }
     }
 
@@ -61,6 +65,7 @@ impl Exchange {
                 | Exchange::GateF
                 | Exchange::AsterF
                 | Exchange::MexcF
+                | Exchange::BingxF
         )
     }
 }

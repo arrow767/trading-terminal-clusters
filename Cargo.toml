@@ -10,6 +10,7 @@ members = [
     "crates/exchange-kucoin",
     "crates/exchange-mexc",
     "crates/exchange-hyperliquid",
+    "crates/exchange-bingx",
     "crates/cluster-engine",
     "crates/wal",
     "crates/clickhouse-sink",
@@ -45,6 +46,7 @@ prost = "0.13"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.6", default-features = false, features = ["compression-gzip"] }
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
