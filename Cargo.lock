@@ -270,6 +270,7 @@ dependencies = [
  "cluster-engine",
  "exchange-aster",
  "exchange-binance",
+ "exchange-bingx",
  "exchange-bitget",
  "exchange-bybit",
  "exchange-core",
@@ -277,6 +278,7 @@ dependencies = [
  "exchange-kucoin",
  "exchange-mexc",
  "exchange-okx",
+ "flate2",
  "futures-util",
  "ops",
  "reqwest",
@@ -424,6 +426,19 @@ dependencies = [
 
 [[package]]
 name = "exchange-binance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exchange-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "exchange-bingx"
 version = "0.1.0"
 dependencies = [
  "async-trait",
