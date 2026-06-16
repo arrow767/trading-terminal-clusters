@@ -14,6 +14,7 @@ mod binance_session;
 mod binance_supervisor;
 mod bitget_session;
 mod bybit_session;
+mod bingx_session;
 mod config;
 mod hyperliquid_session;
 mod kucoin_session;
@@ -690,6 +691,69 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: hyperliquid_perp");
     } else {
         tracing::info!("hyperliquid_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── BingX swap (USDT/USDC perps) ───────────────────────────────────
+    // GZIP WS (open-api-swap.bingx.com), per-symbol @trade, qty в базе.
+    let bingx_perp_cfg = ingest.exchanges.bingx_perp.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("bingx_perp", bingx_perp_cfg.enabled) {
+        let raw = Arc::new(exchange_bingx::BingxInstrumentsInfo::new(
+            exchange_bingx::BingxCategory::Swap,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_bingx::BingxWs::perp());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Bingx,
+            exchange_core::Exchange::BingxF,
+            exchange_core::MarketType::Perp,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            bingx_perp_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: bingx_perp");
+    } else {
+        tracing::info!("bingx_perp not in enabled_exchanges; skipped");
+    }
+
+    // ─── BingX spot (GZIP WS) ────────────────────────────────────────────
+    let bingx_spot_cfg = ingest.exchanges.bingx_spot.clone().unwrap_or_default();
+    if ingest.is_exchange_enabled("bingx_spot", bingx_spot_cfg.enabled) {
+        let raw = Arc::new(exchange_bingx::BingxInstrumentsInfo::new(
+            exchange_bingx::BingxCategory::Spot,
+        ));
+        let info: Arc<dyn exchange_core::ExchangeInfo> = Arc::clone(&raw) as _;
+        let ranker: Option<Arc<dyn exchange_core::VolumeRanker>> = Some(Arc::clone(&raw) as _);
+        let connector: Arc<dyn exchange_core::WsConnector> = Arc::new(exchange_bingx::BingxWs::spot());
+        let supervisor = BinanceSupervisor::new(
+            info,
+            ranker,
+            connector,
+            SessionFlavor::Bingx,
+            exchange_core::Exchange::Bingx,
+            exchange_core::MarketType::Spot,
+            Arc::clone(&bus),
+            ingest.region.clone(),
+            ingest.clone(),
+            bingx_spot_cfg,
+            ch_tx_by_tf.clone(),
+        );
+        let shutdown_for_sup = shutdown_rx.clone();
+        supervisor_tasks.push(tokio::spawn(async move {
+            supervisor.run(shutdown_for_sup).await;
+        }));
+        tracing::info!("supervisor started: bingx_spot");
+    } else {
+        tracing::info!("bingx_spot not in enabled_exchanges; skipped");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а

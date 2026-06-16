@@ -167,6 +167,8 @@ fn parse_exchange(s: &str) -> Option<Exchange> {
         "ASTERF" => Exchange::AsterF,
         "MEXC" => Exchange::Mexc,
         "MEXCF" => Exchange::MexcF,
+        "BINGX" => Exchange::Bingx,
+        "BINGXF" => Exchange::BingxF,
         _ => return None,
     })
 }
