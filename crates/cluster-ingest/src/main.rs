@@ -17,6 +17,7 @@ mod bybit_session;
 mod bingx_session;
 mod config;
 mod hyperliquid_session;
+mod materialize;
 mod kucoin_session;
 mod mexc_session;
 mod okx_session;
@@ -754,6 +755,22 @@ async fn main() -> Result<()> {
         tracing::info!("supervisor started: bingx_spot");
     } else {
         tracing::info!("bingx_spot not in enabled_exchanges; skipped");
+    }
+
+    // ─── Materializer: clusters_1m → 5m/15m/30m/1h for binance/okx/bybit ──
+    // Keeps those long-TF tables hot so the range API reads them directly
+    // (≈2× faster) instead of rolling up on every request. Runs entirely in
+    // ClickHouse (no ingest RAM). 4h/1d stay rollup-on-read.
+    {
+        let shutdown_for_mat = shutdown_rx.clone();
+        let ch_url = ingest.clickhouse_url.clone();
+        let ch_db = ingest.clickhouse_database.clone();
+        let ch_user = std::env::var("CH_USER").unwrap_or_default();
+        let ch_password = std::env::var("CH_PASSWORD").unwrap_or_default();
+        tokio::spawn(async move {
+            materialize::run_materializer(ch_url, ch_db, ch_user, ch_password, shutdown_for_mat).await;
+        });
+        tracing::info!("materializer started (5m/15m/30m/1h for binance/okx/bybit)");
     }
 
     // Дропаем локальные клоны TX-каналов, чтобы при shutdown'е supervisor'а
