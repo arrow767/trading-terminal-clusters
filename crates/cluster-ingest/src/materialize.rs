@@ -23,12 +23,18 @@ use tokio::sync::watch;
 /// Venues whose long TFs we materialize. MUST match
 /// `cluster_api::cluster_history::MATERIALIZED_EXCHANGES`.
 const EXCHANGES_SQL: &str = "'BINANCE','BINANCEF','OKX','OKXF','BYBIT','BYBITF'";
-/// TFs we materialize (5m/15m/30m/1h). MUST match the range handler.
-const TFS: [u32; 4] = [300, 900, 1800, 3600];
-/// Backfill depth — matches clusters_1m retention (7d), so a direct table read
-/// covers all available history (no rollup-fallback / UNION needed).
-const BACKFILL_DAYS: i64 = 7;
+/// TFs we materialize, each with a backfill depth sized to the terminal's
+/// default request span for that TF (capped at clusters_1m's 7d retention) —
+/// the terminal asks 5m≈12h, 15m≈1d, 30m≈3d, 1h≈5d, so materializing the WHOLE
+/// 7d for 5m was both pointless and OOM-heavy. (tf_seconds, backfill_days).
+const TFS: [(u32, i64); 4] = [(300, 1), (900, 2), (1800, 4), (3600, 7)];
 const REFRESH_SECS: u64 = 60;
+/// Backfill is done in ≤1-day chunks so no single CH query is huge; plus the
+/// GROUP BY spills to disk past 1.5 GB and the query is hard-capped at 6 GB so
+/// it never starves ingest (~5 GB) on the 15 GB box.
+const CHUNK_MS: i64 = 86_400_000;
+const CH_SETTINGS: &str =
+    "max_threads=2&max_bytes_before_external_group_by=1500000000&max_memory_usage=6000000000";
 
 fn table_for(tf: u32) -> &'static str {
     match tf {
@@ -73,16 +79,27 @@ pub async fn run_materializer(
         return;
     }
 
-    let now = now_ms();
-    for &tf in &TFS {
-        let from = now - BACKFILL_DAYS * 86_400_000;
-        match materialize(&client, &ch_url, &ch_db, &ch_user, &ch_password, tf, from, now).await {
-            Ok(()) => tracing::info!(tf, "materialize: backfill done"),
-            Err(e) => tracing::warn!(tf, error = %e, "materialize: backfill failed (refresh will retry)"),
+    // One-time backfill, per-TF depth, ≤1-day chunks, newest-first. Exclude the
+    // current open window (refresh fills it) so every backfilled bar is whole.
+    for &(tf, days) in &TFS {
+        let now = now_ms();
+        let tf_ms = (tf as i64) * 1000;
+        let open_start = (now / tf_ms) * tf_ms; // start of the current (open) window
+        let from = open_start - days * CHUNK_MS;
+        let mut chunk_to = open_start;
+        while chunk_to > from {
+            let chunk_from = (chunk_to - CHUNK_MS).max(from);
+            if let Err(e) =
+                materialize(&client, &ch_url, &ch_db, &ch_user, &ch_password, tf, chunk_from, chunk_to).await
+            {
+                tracing::warn!(tf, error = %e, "materialize: backfill chunk failed (refresh will retry)");
+            }
+            chunk_to = chunk_from;
+            if *shutdown.borrow() {
+                return;
+            }
         }
-        if *shutdown.borrow() {
-            return;
-        }
+        tracing::info!(tf, days, "materialize: backfill done");
     }
     cluster_api::cluster_history::CLUSTERS_MATERIALIZED_READY.store(true, Ordering::Relaxed);
     tracing::info!("materialize: READY — serving materialized 5m/15m/30m/1h for binance/okx/bybit");
@@ -96,7 +113,7 @@ pub async fn run_materializer(
             }
             _ = tick.tick() => {
                 let now = now_ms();
-                for &tf in &TFS {
+                for &(tf, _) in &TFS {
                     // Re-roll only the recent window: open + just-closed bars
                     // (≥2×TF, min 15m) — cheap vs the one-time backfill.
                     let refresh_ms = ((tf as i64) * 2).max(900) * 1000;
@@ -154,7 +171,7 @@ async fn materialize(
     );
     // Bound CH resource use so materialization never starves live inserts/reads.
     let url = format!(
-        "{}/?max_threads=4&max_execution_time=600",
+        "{}/?{CH_SETTINGS}&max_execution_time=600",
         ch_url.trim_end_matches('/')
     );
     let mut req = client.post(&url).body(sql);
