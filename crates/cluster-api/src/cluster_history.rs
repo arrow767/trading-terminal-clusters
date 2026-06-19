@@ -21,6 +21,7 @@
 //! Клиент/CDN могут кэшировать долго. Открытый-конец (`to_ms` ≥ now-tf)
 //! помечается `no-cache`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -342,6 +343,28 @@ pub async fn cluster_range(
 /// Обе ветки возвращают 11 колонок в одном порядке —
 /// `[ts_ms, price, bid_qty, ask_qty, trades, price_scale, qty_scale, open, close, high, low]` —
 /// так что парсер ответа общий.
+/// Set true by the materializer (cluster-ingest) once its initial backfill
+/// completes. Until then, materialized TFs are served via rollup (so a fresh
+/// deploy never returns a half-filled table). See `materialize.rs`.
+pub static CLUSTERS_MATERIALIZED_READY: AtomicBool = AtomicBool::new(false);
+
+/// Exchanges + TFs we materialize (clusters_5m/15m/30m/1h written by the
+/// materializer for the major venues). 4h/1d stay rollup-on-read (cheap enough,
+/// expensive to keep materialized). Must match `materialize.rs`.
+const MATERIALIZED_EXCHANGES: [&str; 6] =
+    ["BINANCE", "BINANCEF", "OKX", "OKXF", "BYBIT", "BYBITF"];
+const MATERIALIZED_TFS: [u32; 4] = [300, 900, 1800, 3600];
+
+/// True when this (exchange, TF) has a directly-readable materialized table
+/// (ready + in the materialized set) — so we read it instead of rolling up.
+fn is_materialized(exchange: &str, interval_seconds: u32) -> bool {
+    CLUSTERS_MATERIALIZED_READY.load(Ordering::Relaxed)
+        && MATERIALIZED_TFS.contains(&interval_seconds)
+        && MATERIALIZED_EXCHANGES
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(exchange))
+}
+
 fn build_range_sql(db: &str, q: &RangeParams) -> String {
     let ex = sql_escape(&q.exchange);
     let mt = sql_escape(&q.market_type);
@@ -354,9 +377,10 @@ fn build_range_sql(db: &str, q: &RangeParams) -> String {
         to = q.to_ms,
     );
 
-    if matches!(q.interval_seconds, 30 | 60) {
-        // Прямое чтение базовой таблицы. OHLC — оконной функцией, чтобы
-        // получить ровно один на window (sink дублирует по bucket'ам).
+    if matches!(q.interval_seconds, 30 | 60) || is_materialized(&q.exchange, q.interval_seconds) {
+        // Прямое чтение таблицы: базовые 30s/1m, ИЛИ материализованные
+        // 5m/15m/30m/1h для binance/okx/bybit (их пишет materialize.rs).
+        // OHLC — оконной функцией, ровно один на window (sink дублирует).
         let table = table_name_for(q.interval_seconds);
         return format!(
             "SELECT \
