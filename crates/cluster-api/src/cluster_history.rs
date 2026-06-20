@@ -355,22 +355,35 @@ fn build_range_sql(db: &str, q: &RangeParams) -> String {
     );
 
     if matches!(q.interval_seconds, 30 | 60) {
-        // Прямое чтение базовой таблицы. OHLC — оконной функцией, чтобы
-        // получить ровно один на window (sink дублирует по bucket'ам).
+        // Прямое чтение базовой таблицы. OHLC — детерминированной агрегацией per window,
+        // JOIN'нутой к per-bucket строкам. Раньше было `any(open) OVER (PARTITION BY window_start)`:
+        // OHLC НЕ в ORDER BY (sort key), поэтому разные bucket-строки одного окна несут РАЗНЫЙ OHLC
+        // (записаны в разные моменты), а `any()` берёт ПРОИЗВОЛЬНУЮ строку → нестабильный/неверный
+        // open/close на текущей свече + legacy DEFAULT-0 строки (migration 004) травили low/open.
+        // Фикс: open = maxIf(open,open>0) (open иммутабелен → все ненулевые равны, max убирает 0);
+        // close = argMaxIf(close, ingested_at, close>0) (последний по времени записи ненулевой close);
+        // high/low = maxIf/minIf с >0-гардом. -If только в GROUP BY (переносимо, без оконных -If).
         let table = table_name_for(q.interval_seconds);
         return format!(
             "SELECT \
-               toUnixTimestamp64Milli(window_start) AS ts_ms, \
-               price, bid_qty, ask_qty, trades, \
-               any(price_scale) OVER () AS ps, \
-               any(qty_scale) OVER () AS qs, \
-               any(open) OVER (PARTITION BY window_start) AS o, \
-               any(close) OVER (PARTITION BY window_start) AS c, \
-               any(high) OVER (PARTITION BY window_start) AS h, \
-               any(low) OVER (PARTITION BY window_start) AS l \
-             FROM {db}.{table} FINAL \
+               toUnixTimestamp64Milli(t.window_start) AS ts_ms, \
+               t.price, t.bid_qty, t.ask_qty, t.trades, \
+               w.ps, w.qs, w.o, w.c, w.h, w.l \
+             FROM {db}.{table} AS t FINAL \
+             INNER JOIN ( \
+               SELECT window_start, \
+                 maxIf(price_scale, price_scale > 0) AS ps, \
+                 maxIf(qty_scale, qty_scale > 0)     AS qs, \
+                 maxIf(open, open > 0)               AS o, \
+                 argMaxIf(close, ingested_at, close > 0) AS c, \
+                 maxIf(high, high > 0)               AS h, \
+                 minIf(low, low > 0)                 AS l \
+               FROM {db}.{table} FINAL \
+               WHERE {filter} \
+               GROUP BY window_start \
+             ) AS w ON t.window_start = w.window_start \
              WHERE {filter} \
-             ORDER BY window_start, price \
+             ORDER BY t.window_start, t.price \
              FORMAT JSONCompactEachRow",
         );
     }
@@ -385,6 +398,15 @@ fn build_range_sql(db: &str, q: &RangeParams) -> String {
     // NB: toStartOfInterval(.., SECOND) → DateTime (not DateTime64), so
     // toUnixTimestamp64Milli rejects it. Windows are second-aligned →
     // seconds*1000 = ms exactly.
+    //
+    // OHLC rollup в ДВА уровня (раньше argMin/argMax/max/min прямо по сырым строкам — брало OHLC из
+    // ПРОИЗВОЛЬНОЙ bucket-строки и тонуло на legacy DEFAULT-0):
+    //   s — collapse КАЖДОГО 1m под-окна к его OHLC (по всем его price-строкам): open=maxIf(>0)
+    //       (иммутабелен), close=argMaxIf по ingested_at (истинный последний), high/low=maxIf/minIf(>0).
+    //   w — rollup per rolled-window: open = argMinIf(sub_open, sub_ws, >0) (open ПЕРВОГО под-окна),
+    //       close = argMaxIf(sub_close, sub_ws, >0) (close ПОСЛЕДНЕГО под-окна), high/low = max/min.
+    // Всё в GROUP BY (переносимо). >0-гарды убирают legacy-0. Это и есть детерминированный,
+    // консистентный open/close для досчитанных TF (5m/15m/…).
     format!(
         "SELECT \
            toUnixTimestamp(b.rw) * 1000 AS ts_ms, \
@@ -395,18 +417,29 @@ fn build_range_sql(db: &str, q: &RangeParams) -> String {
              toStartOfInterval(window_start, INTERVAL {n} SECOND, 'UTC') AS rw, \
              price, \
              sum(bid_qty) AS bid_qty, sum(ask_qty) AS ask_qty, sum(trades) AS trades, \
-             any(price_scale) AS ps, any(qty_scale) AS qs \
+             maxIf(price_scale, price_scale > 0) AS ps, maxIf(qty_scale, qty_scale > 0) AS qs \
            FROM {db}.{base} FINAL \
            WHERE {filter} \
            GROUP BY rw, price \
          ) AS b \
          INNER JOIN ( \
-           SELECT \
-             toStartOfInterval(window_start, INTERVAL {n} SECOND, 'UTC') AS rw, \
-             argMin(open, window_start) AS o, argMax(close, window_start) AS c, \
-             max(high) AS h, min(low) AS l \
-           FROM {db}.{base} FINAL \
-           WHERE {filter} \
+           SELECT rw, \
+             argMinIf(sub_open,  sub_ws, sub_open  > 0) AS o, \
+             argMaxIf(sub_close, sub_ws, sub_close > 0) AS c, \
+             maxIf(sub_high, sub_high > 0) AS h, \
+             minIf(sub_low,  sub_low  > 0) AS l \
+           FROM ( \
+             SELECT \
+               toStartOfInterval(window_start, INTERVAL {n} SECOND, 'UTC') AS rw, \
+               window_start AS sub_ws, \
+               maxIf(open, open > 0)                    AS sub_open, \
+               argMaxIf(close, ingested_at, close > 0) AS sub_close, \
+               maxIf(high, high > 0)                    AS sub_high, \
+               minIf(low, low > 0)                      AS sub_low \
+             FROM {db}.{base} FINAL \
+             WHERE {filter} \
+             GROUP BY rw, window_start \
+           ) \
            GROUP BY rw \
          ) AS w ON b.rw = w.rw \
          ORDER BY ts_ms, b.price \
