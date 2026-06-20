@@ -44,6 +44,14 @@ pub async fn run_aggregator(
     let mut partial_ticker = interval(PARTIAL_DELTA_INTERVAL);
     partial_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Раз в минуту светим счётчик дропнутых late/out-of-window трейдов: он
+    // считается в агрегаторе, но иначе НИКЕМ не читается → молчаливая потеря
+    // (например при лаге реконнекта) была невидима оператору. Логируем только
+    // при росте счётчика, чтобы не шуметь на здоровых символах.
+    let mut stats_ticker = interval(STATS_LOG_INTERVAL);
+    stats_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_late: u64 = 0;
+
     loop {
         tokio::select! {
             biased;
@@ -72,6 +80,20 @@ pub async fn run_aggregator(
                     bus.publish(&stream_key, frame);
                 }
             }
+            _ = stats_ticker.tick() => {
+                let late = agg.dropped_late_trades();
+                if late > last_late {
+                    tracing::warn!(
+                        exchange = ?stream_key.symbol.exchange,
+                        symbol = %stream_key.symbol.symbol,
+                        interval_s = stream_key.interval_seconds,
+                        dropped_late_trades = late,
+                        delta = late - last_late,
+                        "aggregator dropped late / out-of-window trades",
+                    );
+                    last_late = late;
+                }
+            }
         }
     }
 }
@@ -81,6 +103,9 @@ pub async fn run_aggregator(
 /// нагрузки на CH-write; увеличение → дольше gap для пейна, открытого
 /// в середине окна.
 const PARTIAL_DELTA_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Период логирования счётчиков агрегатора (дропнутые late-трейды).
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 fn now_ns() -> i64 {
     SystemTime::now()
