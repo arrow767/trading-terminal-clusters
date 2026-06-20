@@ -61,7 +61,11 @@ impl KucoinTradeParser {
         let price = parse_scaled(&px, spec.price_scale)?;
         let qty = parse_scaled(&sz, spec.qty_scale)? * ct_n / ct_d;
 
-        // ts (futures) / time (spot) — nanoseconds.
+        // ts (futures) / time (spot) — nanoseconds. Без валидного ts трейд
+        // принимать НЕЛЬЗЯ: с ts=0 он попал бы в окно «эпоха-1970», а
+        // последующие реальные ts сломали бы оконную привязку (часть трейдов
+        // дропнулась бы как late). Отвергаем — как все прочие парсеры при
+        // отсутствии обязательного поля.
         let ts_ns = {
             let t = num_i64(data.get("ts"));
             if t != 0 {
@@ -70,11 +74,10 @@ impl KucoinTradeParser {
                 num_i64(data.get("time"))
             }
         };
-        let exchange_ts_ns = if ts_ns != 0 {
-            ts_ns
-        } else {
-            0
-        };
+        if ts_ns == 0 {
+            return Err(ExchangeError::Parse("kucoin trade: missing ts/time".into()));
+        }
+        let exchange_ts_ns = ts_ns;
 
         Ok(vec![TradePrint {
             exchange_ts_ns,
@@ -155,5 +158,16 @@ mod tests {
     fn non_trade_peeks_none() {
         let v: serde_json::Value = serde_json::from_str(r#"{"type":"pong"}"#).unwrap();
         assert_eq!(KucoinTradeParser.peek_symbol(&v), None);
+    }
+
+    #[test]
+    fn rejects_trade_with_missing_timestamp() {
+        // No `ts` (futures) / `time` (spot) → MUST reject, never bucket to
+        // epoch-1970 (which would mis-window + drop subsequent real trades).
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"type":"message","topic":"/contractMarket/execution:XBTUSDTM","data":{"price":"100.0","size":1,"side":"buy"}}"#,
+        )
+        .unwrap();
+        assert!(KucoinTradeParser.parse_value(&v, &spec(true)).is_err());
     }
 }

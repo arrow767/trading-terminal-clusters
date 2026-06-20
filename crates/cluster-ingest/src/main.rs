@@ -774,8 +774,19 @@ async fn main() -> Result<()> {
     }
     grpc_handle.abort();
     rest_handle.abort();
-    for h in writer_handles {
-        h.abort();
+
+    // Writer'ы НЕ abort'им: их клоны `ch_tx` уже дропнуты (main выше + все
+    // supervisor'ы завершились), значит per-TF каналы закрыты, и каждый
+    // `ChWriter::run` по close сольёт остаток батча в CH и выйдет сам. Ждём
+    // их (с таймаутом), а не убиваем — иначе последний батч (закрывшиеся
+    // окна в буфере на момент SIGTERM) терялся бы. Таймаут, чтобы зависший
+    // POST (CH недоступен) не держал shutdown вечно.
+    let drain = futures_util::future::join_all(writer_handles);
+    if tokio::time::timeout(std::time::Duration::from_secs(20), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("ch writers did not drain within 20s; exiting anyway");
     }
 
     Ok(())

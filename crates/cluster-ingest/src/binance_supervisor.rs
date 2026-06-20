@@ -257,19 +257,31 @@ impl BinanceSupervisor {
             tracing::info!(added, total = h.len(), "supervisor: added new symbols");
         }
 
-        // Publish updated routes; session task will drop+reconnect to
-        // pick up the new subscription set. send_replace stores the new
-        // value unconditionally — using send() would silently drop the
-        // update during the brief window between supervisor construction
-        // and the session task subscribing.
-        let routes: Vec<SymbolRoute> = h
-            .values()
-            .map(|sh| SymbolRoute {
-                spec: sh.spec.clone(),
-                sink: sh.trade_tx.clone(),
-            })
-            .collect();
-        self.routes_tx.send_replace(routes);
+        // Publish updated routes ТОЛЬКО когда набор символов реально изменился
+        // (add/remove). Иначе `send_replace` срабатывал на КАЖДОМ discovery-
+        // поллинге (раз в `discovery_poll_secs`) и триггерил `routes_rx.changed()`
+        // → `run_session_loop` РВАЛ и переподключал WS каждые N секунд без нужды,
+        // создавая дырку в потоке трейдов по ВСЕМ символам биржи при каждом
+        // реконнекте (бэкфилла за время разрыва нет). Sinks для неизменных
+        // символов персистентны (handle переживает поллинг), так что
+        // переподключаться незачем. Реконнектящаяся сессия и так читает
+        // актуальные routes через `routes_rx.borrow()`, а не через `changed()`.
+        // Первый поллинг всегда имеет added>0 (handles были пусты) → публикует.
+        // ИНВАРИАНТ: spec существующего key неизменен — SymbolKey не включает
+        // scale-поля, а handle не пересоздаётся для уже подписанного символа
+        // (см. `if h.contains_key(&key) { continue }` выше). Если когда-нибудь
+        // spec станет мутабельным на лету, этот гейт нужно будет дополнить
+        // (иначе обновление spec без add/remove не доедет до сессии).
+        if !to_remove.is_empty() || added > 0 {
+            let routes: Vec<SymbolRoute> = h
+                .values()
+                .map(|sh| SymbolRoute {
+                    spec: sh.spec.clone(),
+                    sink: sh.trade_tx.clone(),
+                })
+                .collect();
+            self.routes_tx.send_replace(routes);
+        }
 
         Ok(())
     }
