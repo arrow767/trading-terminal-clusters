@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use exchange_binance::BinanceFuturesTradeParser;
@@ -64,15 +64,36 @@ pub async fn run_session(
 
     let parser = BinanceFuturesTradeParser;
     let mut stats = SessionStats::default();
+    // Per-symbol last aggTrade id, for in-session gap detection. Lives for the
+    // session only: it resets on reconnect, so the id jump across a reconnect is
+    // never miscounted as a "missed trades" hole (that gap is the orchestrator's
+    // concern and is logged there). `last_gap_warn` rate-limits the warn so a
+    // burst of holes can't flood the log; the counters in `stats` stay exact.
+    let mut gap_state: HashMap<String, u64> = HashMap::with_capacity(routes.len());
+    let mut last_gap_warn: Option<Instant> = None;
 
     loop {
         match stream.next().await {
             None => break,
             Some(Ok(Message::Text(t))) => {
-                handle_payload(&parser, &routing, t.as_bytes(), &mut stats);
+                handle_payload(
+                    &parser,
+                    &routing,
+                    t.as_bytes(),
+                    &mut stats,
+                    &mut gap_state,
+                    &mut last_gap_warn,
+                );
             }
             Some(Ok(Message::Binary(b))) => {
-                handle_payload(&parser, &routing, &b, &mut stats);
+                handle_payload(
+                    &parser,
+                    &routing,
+                    &b,
+                    &mut stats,
+                    &mut gap_state,
+                    &mut last_gap_warn,
+                );
             }
             Some(Ok(Message::Ping(p))) => {
                 sink.send(Message::Pong(p)).await.context("send pong")?;
@@ -117,11 +138,14 @@ fn is_soft_close(e: &tokio_tungstenite::tungstenite::Error) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_payload(
     parser: &BinanceFuturesTradeParser,
     routing: &HashMap<String, SymbolRoute>,
     raw: &[u8],
     stats: &mut SessionStats,
+    gap_state: &mut HashMap<String, u64>,
+    last_gap_warn: &mut Option<Instant>,
 ) {
     let v: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(v) => v,
@@ -150,12 +174,67 @@ fn handle_payload(
             return;
         }
     };
+    detect_gap(&upper, trade.trade_id, stats, gap_state, last_gap_warn);
     match route.sink.try_send(trade) {
         Ok(()) => stats.trades_emitted += 1,
         Err(mpsc::error::TrySendError::Full(_)) => stats.trades_dropped_backpressure += 1,
         Err(mpsc::error::TrySendError::Closed(_)) => stats.trades_dropped_closed += 1,
     }
 }
+
+/// Detect missed trades on Binance's per-symbol contiguous aggTrade id (`a`).
+///
+/// Consecutive aggTrades for a symbol carry consecutive `a` values, so a jump
+/// of more than +1 means the venue/transport skipped trades while we were
+/// connected. We record every hole exactly into `stats` and emit a
+/// rate-limited warn (so a burst can't flood the log). `gap_state` keeps the
+/// last seen id per symbol; it never regresses, so out-of-order or duplicate
+/// frames (id ≤ last) are ignored rather than mis-flagged. The very first id
+/// for a symbol (no prior) just primes the state — no gap is reported.
+///
+/// Scoped to Binance/Aster aggTrade because only there is the id per-symbol
+/// monotonic+contiguous; exchanges with global, string, or zeroed ids would
+/// produce false holes, so they never call this.
+fn detect_gap(
+    symbol: &str,
+    trade_id: u64,
+    stats: &mut SessionStats,
+    gap_state: &mut HashMap<String, u64>,
+    last_gap_warn: &mut Option<Instant>,
+) {
+    let last = match gap_state.get_mut(symbol) {
+        Some(slot) => slot,
+        None => {
+            gap_state.insert(symbol.to_owned(), trade_id);
+            return;
+        }
+    };
+    if trade_id > *last + 1 {
+        let missed = trade_id - *last - 1;
+        stats.gaps_detected += 1;
+        stats.trades_missing = stats.trades_missing.saturating_add(missed);
+        let now = Instant::now();
+        if last_gap_warn.is_none_or(|t| now.duration_since(t) >= GAP_WARN_INTERVAL) {
+            tracing::warn!(
+                symbol = %symbol,
+                missed,
+                last = *last,
+                current = trade_id,
+                gaps_total = stats.gaps_detected,
+                missing_total = stats.trades_missing,
+                "binance aggTrade gap — trades missed in-session",
+            );
+            *last_gap_warn = Some(now);
+        }
+    }
+    if trade_id > *last {
+        *last = trade_id;
+    }
+}
+
+/// Minimum spacing between gap warnings per session — counters stay exact, but
+/// we don't want a burst of holes to drown the log.
+const GAP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SessionStats {
@@ -165,6 +244,14 @@ pub struct SessionStats {
     pub parse_errors: u64,
     pub frames_undecodable: u64,
     pub pongs_sent: u64,
+    /// Number of aggTrade-id discontinuities observed this session: a jump of
+    /// more than +1 on Binance's per-symbol contiguous `a`. Each one means the
+    /// exchange/transport skipped trades while we stayed connected (in-session
+    /// loss — distinct from the reconnect gaps the orchestrator already logs).
+    pub gaps_detected: u64,
+    /// Sum of missed trade-ids across all gaps this session — the total size of
+    /// the holes, not just how many holes were seen.
+    pub trades_missing: u64,
 }
 
 #[cfg(test)]
@@ -263,5 +350,70 @@ mod tests {
         let connector = BinanceFuturesWs::with_url("ws://127.0.0.1:1");
         let r = run_session(&connector, &[], Duration::from_millis(100)).await;
         assert!(r.is_err());
+    }
+
+    /// Feed a sequence of ids through `detect_gap` for one symbol and return
+    /// the resulting stats (warn rate-limit state is irrelevant to counters).
+    fn run_gap_seq(ids: &[u64]) -> SessionStats {
+        let mut stats = SessionStats::default();
+        let mut state: HashMap<String, u64> = HashMap::new();
+        let mut warn: Option<Instant> = None;
+        for &id in ids {
+            detect_gap("BTCUSDT", id, &mut stats, &mut state, &mut warn);
+        }
+        stats
+    }
+
+    #[test]
+    fn detect_gap_contiguous_is_clean() {
+        let s = run_gap_seq(&[10, 11, 12, 13]);
+        assert_eq!(s.gaps_detected, 0);
+        assert_eq!(s.trades_missing, 0);
+    }
+
+    #[test]
+    fn detect_gap_first_id_only_primes_no_false_hole() {
+        // A large first id must not be read as a hole from zero.
+        let s = run_gap_seq(&[5_000_000]);
+        assert_eq!(s.gaps_detected, 0);
+        assert_eq!(s.trades_missing, 0);
+    }
+
+    #[test]
+    fn detect_gap_counts_hole_size() {
+        // 11 → 15 skips ids 12,13,14 = 3 missed.
+        let s = run_gap_seq(&[11, 15]);
+        assert_eq!(s.gaps_detected, 1);
+        assert_eq!(s.trades_missing, 3);
+    }
+
+    #[test]
+    fn detect_gap_accumulates_multiple_holes() {
+        // 1→3 (miss 2) then 3→6 (miss 4,5) = 2 holes, 3 missed total.
+        let s = run_gap_seq(&[1, 3, 6]);
+        assert_eq!(s.gaps_detected, 2);
+        assert_eq!(s.trades_missing, 3);
+    }
+
+    #[test]
+    fn detect_gap_ignores_out_of_order_and_dupes() {
+        // 10, then a dupe 10 and an out-of-order 8 must not regress the
+        // high-water mark nor be flagged; 11 after that is still contiguous.
+        let s = run_gap_seq(&[10, 10, 8, 11]);
+        assert_eq!(s.gaps_detected, 0);
+        assert_eq!(s.trades_missing, 0);
+    }
+
+    #[test]
+    fn detect_gap_is_per_symbol() {
+        // Interleaving a second symbol must not create cross-symbol holes.
+        let mut stats = SessionStats::default();
+        let mut state: HashMap<String, u64> = HashMap::new();
+        let mut warn: Option<Instant> = None;
+        for (sym, id) in [("BTCUSDT", 1u64), ("ETHUSDT", 1000), ("BTCUSDT", 2), ("ETHUSDT", 1001)] {
+            detect_gap(sym, id, &mut stats, &mut state, &mut warn);
+        }
+        assert_eq!(stats.gaps_detected, 0);
+        assert_eq!(stats.trades_missing, 0);
     }
 }
