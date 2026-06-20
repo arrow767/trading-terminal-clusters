@@ -267,6 +267,11 @@ impl BinanceSupervisor {
         // переподключаться незачем. Реконнектящаяся сессия и так читает
         // актуальные routes через `routes_rx.borrow()`, а не через `changed()`.
         // Первый поллинг всегда имеет added>0 (handles были пусты) → публикует.
+        // ИНВАРИАНТ: spec существующего key неизменен — SymbolKey не включает
+        // scale-поля, а handle не пересоздаётся для уже подписанного символа
+        // (см. `if h.contains_key(&key) { continue }` выше). Если когда-нибудь
+        // spec станет мутабельным на лету, этот гейт нужно будет дополнить
+        // (иначе обновление spec без add/remove не доедет до сессии).
         if !to_remove.is_empty() || added > 0 {
             let routes: Vec<SymbolRoute> = h
                 .values()
