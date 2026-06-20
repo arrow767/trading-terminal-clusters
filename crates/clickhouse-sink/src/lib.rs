@@ -127,7 +127,7 @@ impl Default for ChWriterConfig {
             batch_size: 5000,
             flush_interval: Duration::from_secs(2),
             request_timeout: Duration::from_secs(15),
-            max_buffer_rows: 50_000, // 10 batches; ~5 MB/writer — bounds a CH outage
+            max_buffer_rows: 300_000, // ~30 MB/writer — absorbs a multi-minute local-CH outage in RAM
         }
     }
 }
