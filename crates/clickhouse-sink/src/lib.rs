@@ -13,7 +13,7 @@
 //! switch to the native protocol later if write throughput becomes a
 //! bottleneck.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use exchange_core::{AnalyticsSnapshot, MarketType, Quote, SymbolSpec};
@@ -111,6 +111,11 @@ pub struct ChWriterConfig {
     pub batch_size: usize,
     pub flush_interval: Duration,
     pub request_timeout: Duration,
+    /// Hard cap on rows held in the in-memory batch. If ClickHouse is slow/down
+    /// and rows pile up past this, the OLDEST are dropped (counted + warned) so
+    /// the writer can't grow without bound and OOM the box. The freshest windows
+    /// survive; durability for the dropped tail is the WAL's job (when wired).
+    pub max_buffer_rows: usize,
 }
 
 impl Default for ChWriterConfig {
@@ -122,9 +127,15 @@ impl Default for ChWriterConfig {
             batch_size: 5000,
             flush_interval: Duration::from_secs(2),
             request_timeout: Duration::from_secs(15),
+            max_buffer_rows: 50_000, // 10 batches; ~5 MB/writer — bounds a CH outage
         }
     }
 }
+
+/// Upper bound on the failure backoff between flush attempts. On repeated CH
+/// insert failures the retry interval doubles up to this, so a down ClickHouse
+/// is not hammered every `flush_interval` and `recv` stays responsive.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 pub struct ChWriter {
     cfg: ChWriterConfig,
@@ -181,6 +192,13 @@ impl ChWriter {
         let mut ticker = interval(self.cfg.flush_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut stats = WriterStats::default();
+        // Backoff gate: on CH failure `next_attempt` is pushed into the future so
+        // we neither re-POST a doomed insert every flush_interval nor block `recv`
+        // on a 15s POST that will fail — recv keeps draining (accumulate + cap).
+        // Reset on success.
+        let mut next_attempt = Instant::now();
+        let mut backoff = self.cfg.flush_interval;
+        let mut last_drop_warn: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -189,21 +207,37 @@ impl ChWriter {
                     match maybe_row {
                         Some(row) => {
                             batch.push(row);
-                            if batch.len() >= self.cfg.batch_size {
-                                self.try_flush(&mut batch, &mut stats).await;
+                            // Bound writer memory: if CH is slow/down and rows pile up,
+                            // drop the OLDEST (freshest windows survive) + count/warn.
+                            if batch.len() > self.cfg.max_buffer_rows {
+                                let drop_n = batch.len() - self.cfg.max_buffer_rows;
+                                batch.drain(0..drop_n);
+                                stats.rows_dropped += drop_n as u64;
+                                let now = Instant::now();
+                                if last_drop_warn.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(5)) {
+                                    tracing::warn!(
+                                        table = %self.cfg.table,
+                                        rows_dropped_total = stats.rows_dropped,
+                                        "ch writer buffer full (CH slow/down?); dropping oldest rows",
+                                    );
+                                    last_drop_warn = Some(now);
+                                }
+                            }
+                            if batch.len() >= self.cfg.batch_size && Instant::now() >= next_attempt {
+                                self.try_flush(&mut batch, &mut stats, &mut next_attempt, &mut backoff).await;
                             }
                         }
                         None => {
                             if !batch.is_empty() {
-                                self.try_flush(&mut batch, &mut stats).await;
+                                self.try_flush(&mut batch, &mut stats, &mut next_attempt, &mut backoff).await;
                             }
                             break;
                         }
                     }
                 }
                 _ = ticker.tick() => {
-                    if !batch.is_empty() {
-                        self.try_flush(&mut batch, &mut stats).await;
+                    if !batch.is_empty() && Instant::now() >= next_attempt {
+                        self.try_flush(&mut batch, &mut stats, &mut next_attempt, &mut backoff).await;
                     }
                 }
             }
@@ -212,16 +246,26 @@ impl ChWriter {
         Ok(stats)
     }
 
-    async fn try_flush(&self, batch: &mut Vec<ClusterRow>, stats: &mut WriterStats) {
+    async fn try_flush(
+        &self,
+        batch: &mut Vec<ClusterRow>,
+        stats: &mut WriterStats,
+        next_attempt: &mut Instant,
+        backoff: &mut Duration,
+    ) {
         match self.flush_once(batch).await {
             Ok(()) => {
                 stats.batches_ok += 1;
                 stats.rows_ok += batch.len() as u64;
                 batch.clear();
+                *backoff = self.cfg.flush_interval;
+                *next_attempt = Instant::now();
             }
             Err(e) => {
                 stats.batches_err += 1;
-                tracing::warn!(error = %e, batch_len = batch.len(), "ch insert failed; will retry");
+                tracing::warn!(error = %e, batch_len = batch.len(), "ch insert failed; retry after backoff");
+                *backoff = (*backoff * 2).min(BACKOFF_MAX);
+                *next_attempt = Instant::now() + *backoff;
             }
         }
     }
@@ -259,6 +303,8 @@ pub struct WriterStats {
     pub batches_ok: u64,
     pub batches_err: u64,
     pub rows_ok: u64,
+    /// Rows dropped because the batch hit `max_buffer_rows` (CH slow/down).
+    pub rows_dropped: u64,
 }
 
 /// Minimal application/x-www-form-urlencoded encoder for the query
