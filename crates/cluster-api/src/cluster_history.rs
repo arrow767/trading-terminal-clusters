@@ -627,8 +627,12 @@ mod tests {
             assert!(!s.contains("clusters_5m") && !s.contains("clusters_1d"),
                 "{iv}: must not touch the stale per-TF tables");
             assert!(s.contains(&format!("INTERVAL {iv} SECOND")), "{iv}: rolled boundary");
-            assert!(s.contains("sum(bid_qty)") && s.contains("argMin(open"),
-                "{iv}: additive buckets + window OHLC");
+            assert!(
+                s.contains("sum(bid_qty)")
+                    && s.contains("argMinIf(sub_open")
+                    && s.contains("argMaxIf(sub_close"),
+                "{iv}: additive buckets + deterministic two-level OHLC rollup",
+            );
             // 11-column output order preserved for the shared parser.
             assert!(s.contains("b.price, b.bid_qty, b.ask_qty, b.trades, b.ps, b.qs, w.o, w.c, w.h, w.l"));
         }
